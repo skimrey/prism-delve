@@ -8,14 +8,18 @@ Run these from the project folder (the one with this file in it).
 1. SET UP (once)
 ----------------
     python3 -m venv .venv
-    ./.venv/bin/pip install pygame-ce
+    .venv\Scripts\python\pip install pygame-ce
 
   (On Windows, use .venv\Scripts\python and .venv\Scripts\pip instead of ./.venv/bin/...)
-
+.\.venv\Scripts\python.exe -m pip install pygame-ce
 
 2. PLAY
 -------
     ./.venv/bin/python -m prism
+
+Windows
+
+.\.venv\Scripts\python.exe -m prism
 
   Optional: --seed=123 to play a particular climb again.
   Your progress is saved in ~/.prism_delve/ (delete that folder to start fresh).
@@ -24,6 +28,10 @@ Run these from the project folder (the one with this file in it).
 3. TEST MODE (jump anywhere, cheats)
 ------------------------------------
     ./.venv/bin/python -m prism --dev
+
+Windows
+
+.\.venv\Scripts\python.exe -m prism --dev
 
   On a Mac you can double-click play_dev.command instead.
   In test mode: F1 opens the Dev menu on any screen. It has two tabs:
