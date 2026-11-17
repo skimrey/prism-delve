@@ -3,27 +3,37 @@ preview can simulate freely."""
 
 from dataclasses import dataclass
 
-from .consts import (DEFAULT_MODS, GRID_H, GRID_W, PLAYER_HP, PLAYER_START,
-                     PRIMARIES, START_CAP, START_CHARGES)
+from .consts import (COLOR_NAMES, DEFAULT_MODS, GRID_H, GRID_W, PATTERNS, PLAYER_HP,
+                     PLAYER_START, PRIMARIES, SHAPE_PLURAL, START_CAP, START_CHARGES,
+                     START_PATTERNS)
+
+DIR_NAMES = {(0, -1): "up", (1, 0): "right", (0, 1): "down", (-1, 0): "left",
+             (1, -1): "up-right", (1, 1): "down-right", (-1, 1): "down-left",
+             (-1, -1): "up-left"}
 
 
 @dataclass(frozen=True)
 class Action:
-    """One beat of the player's plan: move, cast or wait."""
+    """One beat of the player's plan: move, cast or wait.
+
+    For a cast, (dx, dy) is the aim: a unit direction for Beam and Slant, the
+    offset of the landing tile for Lob, and (0, 0) for Halo and Leap."""
     kind: str
     dx: int = 0
     dy: int = 0
+    pattern: str = ""
     shape: str = ""
     color: str = ""
-    tx: int = 0
-    ty: int = 0
 
     def describe(self):
         if self.kind == "move":
-            names = {(0, -1): "up", (1, 0): "right", (0, 1): "down", (-1, 0): "left"}
-            return "Move " + names.get((self.dx, self.dy), "?")
+            return "Move " + DIR_NAMES.get((self.dx, self.dy), "?")
         if self.kind == "cast":
-            return "%s %s" % (self.color, self.shape)
+            aim = DIR_NAMES.get((self.dx, self.dy), "")
+            return "%s %s%s at %s" % (COLOR_NAMES.get(self.color, "?"),
+                                      PATTERNS.get(self.pattern, {"name": "?"})["name"],
+                                      " " + aim if aim else "",
+                                      SHAPE_PLURAL.get(self.shape, "?"))
         return "Wait"
 
 
@@ -31,8 +41,8 @@ def move(dx, dy):
     return Action("move", dx=dx, dy=dy)
 
 
-def cast(shape, color, tx, ty):
-    return Action("cast", shape=shape, color=color, tx=tx, ty=ty)
+def cast(pattern, shape, color, dx=0, dy=0):
+    return Action("cast", dx=dx, dy=dy, pattern=pattern, shape=shape, color=color)
 
 
 def wait():
@@ -40,17 +50,37 @@ def wait():
 
 
 class Board:
-    __slots__ = ("w", "h", "walls")
+    """The room. `portals` are holes in the floor, in pairs: a circle rolling
+    into one drops through and rolls out of its partner, still rolling the
+    same way. Only round things fall in: corners catch on the rim, so the Set
+    walk straight over them (and so does light). `tiles` are the other
+    special floor tiles, which likewise only matter to something rolling."""
+    __slots__ = ("w", "h", "walls", "portals", "pairs", "tiles")
 
-    def __init__(self, w=GRID_W, h=GRID_H, walls=()):
+    def __init__(self, w=GRID_W, h=GRID_H, walls=(), portals=(), tiles=None):
         self.w = w
         self.h = h
         self.walls = frozenset(walls)
+        # other special floor tiles, (x, y) -> kind (see consts.TWISTS and
+        # rules.roll_route): "spring", "drift", "bend/", "bend\\", "pool:R" ...
+        self.tiles = dict(tiles or {})
+        self.pairs = tuple((tuple(a), tuple(b)) for a, b in portals)
+        self.portals = {}
+        for a, b in self.pairs:
+            self.portals[a] = b
+            self.portals[b] = a
+
+    def pair_index(self, tile):
+        """Which pair a hole belongs to (its colour on the board), or None."""
+        for i, (a, b) in enumerate(self.pairs):
+            if tile in (a, b):
+                return i
+        return None
 
 
 class Player:
     __slots__ = ("x", "y", "hp", "max_hp", "shield", "palette", "cap",
-                 "chain", "last_shape", "mods")
+                 "patterns", "used", "mods", "rolls")
 
     def __init__(self):
         self.x, self.y = PLAYER_START
@@ -59,15 +89,15 @@ class Player:
         self.shield = 0
         self.cap = {c: START_CAP for c in PRIMARIES}
         self.palette = {c: START_CHARGES for c in PRIMARIES}
-        self.chain = 0
-        self.last_shape = None
+        self.patterns = list(START_PATTERNS)   # patterns you know (grows over a run)
+        self.used = frozenset()                # patterns already cast this turn
         self.mods = dict(DEFAULT_MODS)
+        self.rolls = False                     # a circle: moves roll until something stops you
 
     def begin_fight(self):
         self.x, self.y = PLAYER_START
         self.shield = 0
-        self.chain = 0
-        self.last_shape = None
+        self.used = frozenset()
         self.palette = {c: min(self.cap[c], START_CHARGES) for c in PRIMARIES}
 
     def clone(self):
@@ -75,22 +105,25 @@ class Player:
         p.x, p.y, p.hp, p.max_hp, p.shield = self.x, self.y, self.hp, self.max_hp, self.shield
         p.palette = dict(self.palette)
         p.cap = self.cap          # caps never change inside a fight
-        p.chain = self.chain
-        p.last_shape = self.last_shape
+        p.patterns = self.patterns  # nor do the patterns you know
+        p.used = self.used
         p.mods = self.mods        # mods never change inside a fight
+        p.rolls = self.rolls
         return p
 
 
 class Enemy:
-    __slots__ = ("id", "kind", "x", "y", "hp", "max_hp", "color", "shield",
-                 "stun", "burn", "orders")
+    __slots__ = ("id", "kind", "x", "y", "hp", "max_hp", "color", "shape", "shield",
+                 "stun", "burn", "orders", "squad")
 
-    def __init__(self, eid, kind, x, y, hp, color):
+    def __init__(self, eid, kind, x, y, hp, color, shape):
         self.id = eid
         self.kind = kind
         self.x, self.y = x, y
         self.hp = self.max_hp = hp
         self.color = color
+        self.shape = shape        # what your light must be cut to fit
+        self.squad = None         # enemies sharing a squad id march in formation
         self.shield = 0
         self.stun = 0
         self.burn = 0
@@ -99,8 +132,9 @@ class Enemy:
     def clone(self):
         e = Enemy.__new__(Enemy)
         e.id, e.kind, e.x, e.y = self.id, self.kind, self.x, self.y
-        e.hp, e.max_hp, e.color = self.hp, self.max_hp, self.color
+        e.hp, e.max_hp, e.color, e.shape = self.hp, self.max_hp, self.color, self.shape
         e.shield, e.stun, e.burn = self.shield, self.stun, self.burn
+        e.squad = self.squad
         e.orders = self.orders    # orders are replaced, never mutated
         return e
 
@@ -116,8 +150,8 @@ class GameState:
         self.next_id = 1
         self.outcome = "ongoing"
 
-    def add_enemy(self, kind, x, y, color, hp):
-        e = Enemy(self.next_id, kind, x, y, hp, color)
+    def add_enemy(self, kind, x, y, color, hp, shape):
+        e = Enemy(self.next_id, kind, x, y, hp, color, shape)
         self.next_id += 1
         self.enemies.append(e)
         return e

@@ -9,19 +9,27 @@ The search never mutates the state it is given.
 
 from dataclasses import dataclass, field
 
-from .consts import COMPONENTS, COLORS, ORTH, PRIMARIES, SHAPES
-from .rules import (begin_turn, can_afford, end_turn, resolve_beat, shape_range,
-                    shape_tiles, validate_action)
+from .consts import COLORS, COMPONENTS, ORTH, PATTERN_ORDER, PRIMARIES
+from .rules import (begin_turn, can_afford, end_turn, fitting_targets, pattern_aims,
+                    pattern_tiles, resolve_beat, set_boss_shapes, validate_action)
 from .state import cast, move, wait
 
+# A constraint is allow(pattern, colour) -> bool. "Styles" of winning are
+# proven distinct by winning with one tool banned at a time.
 CONSTRAINTS = {
     "any": None,
-    "no_mix": lambda shape, color: color in PRIMARIES,
-    "no_red": lambda shape, color: "R" not in COMPONENTS[color],
-    "no_square": lambda shape, color: shape != "square",
-    "no_triangle": lambda shape, color: shape != "triangle",
-    "no_circle": lambda shape, color: shape != "circle",
+    "no_mix": lambda pattern, color: color in PRIMARIES,
+    "no_red": lambda pattern, color: "R" not in COMPONENTS[color],
 }
+for _pat in PATTERN_ORDER:
+    CONSTRAINTS["no_" + _pat] = (lambda banned: lambda pattern, color: pattern != banned)(_pat)
+
+
+def constraints_for(player):
+    """The bans that mean something for this player: no point banning a
+    pattern they don't know."""
+    return [n for n in CONSTRAINTS
+            if n != "any" and (n[3:] not in PATTERN_ORDER or n[3:] in player.patterns)]
 
 
 @dataclass
@@ -32,46 +40,48 @@ class SolveResult:
     hp_left: int = 0
 
     def used(self):
-        """(shapes, colours) the winning plan cast with."""
-        shapes, colors = set(), set()
+        """(patterns, colours) the winning plan cast with."""
+        patterns, colors = set(), set()
         for turn in self.plan:
             for a in turn:
                 if a.kind == "cast":
-                    shapes.add(a.shape)
+                    patterns.add(a.pattern)
                     colors.add(a.color)
-        return shapes, colors
+        return patterns, colors
 
 
-def candidate_actions(state, allow=None, per_shape=4):
-    """A pruned but varied set of legal actions for the next beat."""
+def candidate_actions(state, allow=None):
+    """A pruned but varied set of legal actions for the next beat: every
+    move, and every cast that lands on something, once per distinct set of
+    enemies it would land on."""
     p = state.player
     acts = [wait()]
     for dx, dy in ORTH:
         a = move(dx, dy)
         if validate_action(state, a)[0]:
             acts.append(a)
-    rng = shape_range(state)
-    for shape in SHAPES:
-        seen = {}
-        for tx in range(p.x - rng, p.x + rng + 1):
-            for ty in range(p.y - rng, p.y + rng + 1):
-                tiles = shape_tiles(state, shape, tx, ty)
-                if not tiles:
-                    continue
-                key = frozenset(tiles)
-                hits = sum(1 for t in tiles if state.enemy_at(*t))
-                if hits and (key not in seen or seen[key][0] < hits):
-                    seen[key] = (hits, tx, ty)
-        best = sorted(seen.values(), key=lambda h: -h[0])[:per_shape]
-        for color in COLORS:
-            if allow and not allow(shape, color):
+    seen = set()
+    for pattern in p.patterns:
+        if pattern in p.used:
+            continue
+        for dx, dy in pattern_aims(pattern):
+            tiles = pattern_tiles(state, pattern, dx, dy)
+            if not tiles:
                 continue
-            if not can_afford(p, color):
-                continue
-            for _, tx, ty in best:
-                acts.append(cast(shape, color, tx, ty))
-    if (allow is None or allow("circle", "B")) and can_afford(p, "B"):
-        acts.append(cast("circle", "B", p.x, p.y))      # pure defence: a shield
+            shapes = {e.shape for e in (state.enemy_at(*t) for t in tiles) if e is not None}
+            for shape in shapes:
+                ids = frozenset(e.id for e in fitting_targets(state, tiles, shape))
+                for color in COLORS:
+                    if allow and not allow(pattern, color):
+                        continue
+                    if not can_afford(p, color) or (ids, color) in seen:
+                        continue
+                    seen.add((ids, color))
+                    acts.append(cast(pattern, shape, color, dx, dy))
+    # pure defence: blue light that lands on nothing still shields you
+    if "halo" in p.patterns and "halo" not in p.used and can_afford(p, "B") \
+            and (allow is None or allow("halo", "B")) and pattern_tiles(state, "halo"):
+        acts.append(cast("halo", "triangle", "B"))
     return acts
 
 
@@ -88,9 +98,8 @@ def score(state):
 
 def _signature(s):
     p = s.player
-    return (p.x, p.y, p.hp, p.shield, tuple(sorted(p.palette.items())), p.chain,
-            p.last_shape,
-            tuple((e.id, e.x, e.y, e.hp, e.shield, e.stun, e.burn, e.color)
+    return (p.x, p.y, p.hp, p.shield, tuple(sorted(p.palette.items())), p.used,
+            tuple((e.id, e.x, e.y, e.hp, e.shield, e.stun, e.burn, e.color, e.shape)
                   for e in s.enemies))
 
 
@@ -102,6 +111,7 @@ def solve(state, allow=None, max_turns=4, beat_beam=10, turn_beam=5):
         for beat in range(4):
             nxt = {}
             for s, plan, acts in cur:
+                set_boss_shapes(s, beat)     # a Keeper's shape this beat decides what fits it
                 for a in candidate_actions(s, allow):
                     s2 = s.clone()
                     resolve_beat(s2, a, beat)
@@ -139,5 +149,5 @@ def solve(state, allow=None, max_turns=4, beat_beam=10, turn_beam=5):
 
 def count_paths(state, names=None, **kw):
     """Solve under each named constraint. Returns {name: SolveResult}."""
-    names = names or [n for n in CONSTRAINTS if n != "any"]
+    names = names or constraints_for(state.player)
     return {n: solve(state, CONSTRAINTS[n], **kw) for n in names}

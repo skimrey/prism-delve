@@ -1,22 +1,21 @@
-"""All screens: title, help, route map, combat, reward, shop, rest, event, end."""
+"""Core screens: title, help and the floor map (route). Combat lives in combat_ui."""
 
 import math
+import threading
 
 import pygame
 
-from . import rules
-from .consts import (BEATS, COLOR_EFFECT, COLOR_NAMES, COLOR_RGB, COLORS, COMPONENTS,
-                     GRID_H, GRID_W, OPPOSITE, PRIMARIES, RELICS, SHAPE_DESC,
-                     SHAPE_NAMES, SHAPES)
-from .enemies import KINDS, is_boss
-from .state import cast, move, wait
-from .widgets import (ACCENT, BAD, BG, DIM, GOOD, GRID_A, GRID_B, PANEL, PANEL_LIGHT,
-                      TEXT, WALL, WARN, Button, draw_shape, draw_text, draw_wrapped,
-                      tint, wrap_text)
-
-CELL = 56
-OX, OY = 24, 64
-BEAT_TIME = 0.55
+from .art import blink_now, draw_critter, draw_player, ease_out, mix
+from .consts import COLOR_RGB, COLORS, PATTERN_ORDER, PATTERNS, RELICS, SHAPES, TOWERS
+from .rules import GROUP_STEP
+from .scene import (TITLE_SKY, Backdrop, draw_exit_door, draw_facet,
+                    draw_node_icon, draw_pattern_icon,
+                    draw_slot, draw_tower, glint_icon, heading, heart_icon,
+                    node_blurb, node_color, node_title, stat_chip)
+from . import sound
+from .settings import SETTINGS
+from .widgets import (BAD, DIM, GOOD, INK, PAPER, SUNNY, TEXT, WARN, WHITE, Button, draw_card,
+                      draw_colour_mark, draw_text, draw_wrapped, font)
 
 
 class Screen:
@@ -26,6 +25,7 @@ class Screen:
         self.hover = None
         self.msg = ""
         self.msg_color = DIM
+        self.t = 0.0
 
     # -- plumbing
     def add(self, rect, label, callback, **kw):
@@ -64,43 +64,47 @@ class Screen:
         return False
 
     def update(self, dt):
-        return False
+        """Every screen is gently alive (confetti, bobbing), so always redraw."""
+        self.t += dt
+        return True
 
     def draw_buttons(self, surf):
-        f = self.app.fonts[22]
+        f = font(22)
         for b in self.buttons:
             b.draw(surf, f, hover=(b is self.hover))
 
     def draw(self, surf):
-        surf.fill(BG)
+        surf.fill(PAPER)
         self.draw_buttons(surf)
 
 
-_BIG = None
-
-
 class CardButton(Button):
-    """A wide button with a title and a description line."""
+    """A wide card with a title, a description line and an optional icon."""
 
-    def __init__(self, rect, label, desc, callback, **kw):
+    def __init__(self, rect, label, desc, callback, icon=None, **kw):
         super().__init__(rect, label, callback, **kw)
         self.desc = desc
+        self.card_icon = icon
 
-    def draw(self, surf, font, hover=False):
-        base = self.color if self.enabled else (36, 38, 52)
-        if self.enabled and hover:
-            base = tuple(min(255, c + 22) for c in base)
-        pygame.draw.rect(surf, base, self.rect, border_radius=8)
-        pygame.draw.rect(surf, (96, 104, 140) if self.enabled else (50, 52, 70),
-                         self.rect, 1, border_radius=8)
-        global _BIG
-        if _BIG is None:
-            _BIG = pygame.font.Font(None, 28)
-        big = _BIG
-        color = TEXT if self.enabled else (96, 100, 120)
-        draw_text(surf, big, self.label, (self.rect.x + 14, self.rect.y + 8), color)
-        draw_wrapped(surf, font, self.desc, (self.rect.x + 14, self.rect.y + 34),
-                     self.rect.w - 28, DIM if self.enabled else (80, 84, 104))
+    def draw(self, surf, fnt, hover=False):
+        r = self.rect
+        lift = -3 if (hover and self.enabled) else 0
+        fill = PAPER if self.enabled else (232, 226, 218)
+        if hover and self.enabled:
+            fill = (255, 240, 200)
+        body = draw_card(surf, r.move(0, lift), fill, 12, 5 if self.enabled else 0,
+                         INK if self.enabled else (190, 182, 198))
+        x = body.x + 16
+        if self.card_icon is not None:
+            self.card_icon(surf, body.x + 36, body.centery)
+            x = body.x + 70
+        color = TEXT if self.enabled else (150, 140, 165)
+        if not self.desc:
+            draw_text(surf, font(28), self.label, (x, body.centery - 10), color)
+            return
+        draw_text(surf, font(28), self.label, (x, body.y + 10), color)
+        draw_wrapped(surf, fnt, self.desc, (x, body.y + 38), body.right - x - 14,
+                     DIM if self.enabled else (170, 162, 182))
 
 
 # ----------------------------------------------------------------- title
@@ -108,686 +112,611 @@ class CardButton(Button):
 class TitleScreen(Screen):
     def __init__(self, app):
         super().__init__(app)
-        self.add((380, 300, 200, 48), "New Run", app.new_run, key=pygame.K_RETURN,
-                 color=(70, 90, 160))
-        self.add((380, 360, 200, 48), "How to Play", lambda: app.push(HelpScreen(app)),
-                 key=pygame.K_h)
-        self.add((380, 420, 200, 48), "Quit", app.quit, key=pygame.K_ESCAPE)
+        self.backdrop = Backdrop(TITLE_SKY, seed=5, n=40, soft=0.25)
+        items = [("New Run", app.start_run, pygame.K_RETURN, "new")]
+        if app.has_save():
+            items.append(("Continue", app.continue_run, pygame.K_c, "continue"))
+        if app.hub_open():
+            items.append(("The Meadow", app.show_hub, pygame.K_m, "meadow"))
+        items += [("The Story", app.show_intro, pygame.K_t, "story"),
+                  ("How to Play", lambda: app.push(HelpScreen(app)), pygame.K_h, "help"),
+                  ("Settings", lambda: app.push(SettingsScreen(app)), pygame.K_o, "settings"),
+                  ("Quit", app.quit, pygame.K_ESCAPE, "quit")]
+        y = 318
+        for label, fn, key, tag in items:
+            self.add((380, y, 200, 35), label, fn, key=key, tag=tag)
+            y += 39
+        if app.dev:
+            from .dev import DevScreen           # testing mode only
+            self.add((600, y - 39, 100, 35), "Dev", lambda: app.push(DevScreen(app)), tag="dev",
+                     key=pygame.K_F1)
+
+    def update(self, dt):
+        self.backdrop.update(dt)
+        return super().update(dt)
+
+    def _far_towers(self):
+        """Small pictures of the towers you've reached so far (for the skyline)."""
+        if not hasattr(self, "_towers"):
+            from .towers_art import tower_canvas
+            from .world import World, plan_of
+            data = self.app.meta.data
+            self._towers = []
+            if data.get("wins", 0) > 0 or self.app.dev:
+                world = World(plan_of(data), data.get("friends", []))
+                for z in world.zones[:6]:
+                    img, _meta = tower_canvas(z.tower)
+                    self._towers.append(pygame.transform.scale(img, (img.get_width() // 3, img.get_height() // 3)))
+        return self._towers
 
     def draw(self, surf):
-        surf.fill(BG)
-        f = self.app.fonts
-        draw_text(surf, f[72], "PRISM DELVE", (480, 130), TEXT, center=True)
-        draw_text(surf, f[26], "Plan four beats. Mix colours. Shape the fight.",
-                  (480, 190), DIM, center=True)
-        for i, c in enumerate(COLORS):
-            draw_shape(surf, SHAPES[i % 3], 330 + i * 60, 245, 14, COLOR_RGB[c])
+        t = self.t
+        from .hubart import title_scene
+        scene = title_scene(t, self._far_towers())
+        surf.blit(pygame.transform.scale(scene, (960, 640)), (0, 0))
+        # the title: every letter its own colour, bobbing in a wave
+        word = "PRISM DELVE"
+        f = font(96)
+        widths = [f.size(ch)[0] for ch in word]
+        x = 480 - sum(widths) // 2
+        for i, ch in enumerate(word):
+            y = 92 + math.sin(t * 2.2 + i * 0.55) * 6
+            if ch != " ":
+                col = COLOR_RGB[COLORS[i % 6]]
+                for ox, oy in ((-3, 0), (3, 0), (0, -3), (0, 3), (0, 6), (3, 6), (-3, 6)):
+                    surf.blit(f.render(ch, True, INK), (x + ox, y + oy))
+                surf.blit(f.render(ch, True, col), (x, y))
+            x += widths[i]
+        rolled = bool(self.app.meta.data.get("finale_seen"))      # (after the Grand Roll, it's Tri rolling too)
+        heading(surf, "a triangle who learned to roll" if rolled else "a triangle who wants to roll", (480, 196),
+                32, center=True)
+        # Tri watches a circle roll past, on a floating island, and follows it with its eyes
+        ground = 296
+        cx = 480 + math.sin(t * 0.7) * 300
+        roll = -math.sin(t * 0.7) * 300 / 22
+        draw_player(surf, "circle", cx, ground - 22, 22, t, look=(math.cos(t * 0.7), 0),
+                    mood="happy", rot=roll)
+        if rolled:                                                   # racing it, round, all the way round
+            tx = 480 + math.sin(t * 0.7 - 0.5) * 300
+            draw_player(surf, "circle", tx, ground - 26, 26, t, look=(math.cos(t * 0.7 - 0.5), 0),
+                        mood="happy", rot=-math.sin(t * 0.7 - 0.5) * 300 / 26)
+        else:
+            trix = 180
+            look = ((cx - trix) / 300, -0.2)
+            draw_player(surf, "triangle", trix, ground - 26, 26, t, look=look,
+                        blink=blink_now(t, 2))
         d = self.app.meta.data
-        draw_text(surf, f[22], "Runs %d   Wins %d   Best act %d" % (d["runs"], d["wins"], d["best_act"]),
-                  (480, 500), DIM, center=True)
-        draw_text(surf, f[18], "Enter: new run   H: how to play   Esc: quit", (480, 530),
-                  DIM, center=True)
+        draw_text(surf, font(22), "Climbs %d   Rolled away %d   Highest floor %d"
+                  % (d["runs"], d["wins"], d["best_act"]), (480, 604), WHITE, center=True, shadow=INK)
+        draw_text(surf, font(18), "Enter: new run   T: story   H: how to play   O: settings   Esc: quit",
+                  (480, 624), WHITE, center=True, shadow=INK)
         self.draw_buttons(surf)
 
 
-HELP_TEXT = (
-    "THE TURN\n"
-    "Each turn you queue up to 4 beats: move, cast, or wait. Press Enter to resolve. "
-    "Each beat you act first, then every enemy acts. Enemy attacks are shown as orange "
-    "tiles with the beat number; red-outlined tiles will hit you.\n\n"
-    "CASTING\n"
-    "Pick a shape (1/2/3) and a colour (R G B Y C M), then click a target tile. "
-    "Triangle pierces a line of 3, Square hits a 2x2 block, Circle hits a plus shape. "
-    "Primaries cost one charge. Mixed colours cost one of each part: Yellow = R+G, "
-    "Cyan = G+B, Magenta = R+B. Charges regenerate each turn.\n\n"
-    "COLOURS\n"
-    "Red hits hard. Green pushes (walls and allies hurt). Blue stuns and shields you. "
-    "Yellow burns. Cyan stuns and swaps places. Magenta explodes onto neighbours. "
-    "The OPPOSITE colour to an enemy deals double damage; its OWN colour is absorbed. "
-    "Opposites: Red-Cyan, Green-Magenta, Blue-Yellow.\n\n"
-    "CHAINS\n"
-    "Casting a different shape from your previous cast raises your chain and the "
-    "damage multiplier (x1, x1.5, x2, x2.5). Repeating a shape resets it.\n\n"
-    "KEYS\n"
-    "Arrows/WASD move. Space waits. Backspace/Z undo. X clears. Esc cancels a cast. "
-    "Enter resolves. Click a timeline slot to cut the plan back to it."
+# ----------------------------------------------------------------- floor pick
+
+class FloorPickScreen(Screen):
+    """New Run, once you've been higher than the bottom: the Sorter remembers
+    every floor you've reached, and you can slot in at any of them."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        from .consts import FLOORS
+        self.floors = FLOORS
+        self.reached = app.floors_reached()
+        self.backdrop = Backdrop(TITLE_SKY, seed=4, n=22, soft=0.3)
+        for act in (1, 2, 3):
+            r = self.card_rect(act)
+            self.add((r.x + 30, r.bottom - 56, r.w - 60, 40), "Start here", lambda a=act: app.new_run(a),
+                     enabled=act <= self.reached, tag="floor:%d" % act, key=getattr(pygame, "K_%d" % act))
+        self.add((380, 580, 200, 44), "Back", app.to_title, key=pygame.K_ESCAPE, tag="back")
+
+    def card_rect(self, act):
+        return pygame.Rect(60 + (act - 1) * 290, 130, 260, 420)
+
+    def update(self, dt):
+        self.backdrop.update(dt)
+        return super().update(dt)
+
+    def draw(self, surf):
+        from .art import gradient
+        from .consts import FORMS
+        self.backdrop.draw(surf)
+        heading(surf, "Where do you slot in?", (480, 52), 44, center=True)
+        draw_text(surf, font(20), "The Sorter remembers every floor you've reached. Start at the bottom, or "
+                  "slot in higher:", (480, 98), WHITE, center=True, shadow=INK)
+        for act in (1, 2, 3):
+            r = self.card_rect(act)
+            floor = self.floors[act]
+            open_ = act <= self.reached
+            draw_card(surf, r, PAPER if open_ else (206, 198, 222))
+            pic = pygame.Rect(r.x + 12, r.y + 12, r.w - 24, 150)
+            surf.blit(gradient(pic.size, *floor["sky"]), pic.topleft)
+            pygame.draw.rect(surf, INK, pic, 2)
+            form = FORMS[act]
+            draw_player(surf, form["shape"], pic.centerx, pic.centery + 10, 36, self.t, look=(0.3, -0.3),
+                        mood="happy" if open_ else "plain", rot=math.sin(self.t * 2 + act) * 0.08)
+            if not open_:
+                veil = pygame.Surface(pic.size, pygame.SRCALPHA)
+                veil.fill((40, 30, 72, 150))
+                surf.blit(veil, pic.topleft)
+                draw_text(surf, font(20), "not reached yet", pic.center, WHITE, center=True, shadow=INK)
+            draw_text(surf, font(26), floor["name"], (r.centerx, r.y + 184), INK, center=True)
+            draw_text(surf, font(18), "as a %s" % form["name"].lower(), (r.centerx, r.y + 210), DIM, center=True)
+            words = floor["blurb"]
+            if act > 1:
+                words += " You start with the sides and patterns the Keepers below would give, and %d glint." % (
+                    45 * (act - 1))
+            draw_wrapped(surf, font(17), words, (r.x + 20, r.y + 236), r.w - 40, TEXT, center=True)
+        self.draw_buttons(surf)
+
+
+# ----------------------------------------------------------------- help
+
+HELP_WORLD = (
+    "Everything with corners lives in the Sorter: a tower of floors where every door is cut "
+    "for one shape. You are Tri, a triangle. You are also a prism: light goes into you white "
+    "and comes out as colour. That colour is what you fight with.\n\n"
+    "Corners catch on the floor, so everything in the Sorter moves in clicks, four clicks a "
+    "turn, everyone together. That is the grid, and those are the beats. Only circles move "
+    "smoothly. Circles roll out through the Round Door, down the Long Ramp, into the Meadow. "
+    "Tri wants to roll.\n\n"
+    "The Set are the shapes that stay exactly as they were cut. A shape that grows a side "
+    "leaves a hole in the Sorter, and the Set are afraid of holes, so they come to knock you "
+    "back into your slot. They are not cruel. They are tidy.\n\n"
+    "Your light follows the Sorter's one rule: it only fits one shape at a time, and passes "
+    "through every other. Each Set shape is also dyed one colour: its own colour passes "
+    "straight through it, its opposite unmakes it. Knocked loose, a shape falls apart into "
+    "edges and leaves glint behind, and the patterns it fought with are yours to learn.\n\n"
+    "Each floor's Keeper holds a spare side. Take it and you grow: Triangle, Square, Pentagon, "
+    "and then the Round Door. If the Set win, they sort you back to the bottom, a triangle "
+    "again. That is why every climb starts over."
 )
+
+HELP_RULES = (
+    "THE TURN  Queue up to 4 beats: move, cast or wait. Enter resolves them. Each beat you act "
+    "first, then every enemy. Stripes: where the Set will strike. A badge on a stripe is a tiny "
+    "copy of WHO strikes with WHEN (the beat). Pink: that strike lands on you. Numbered dots: "
+    "where a shape steps. Hover a beat slot (or Q/E) to watch one beat at a time; K shows the "
+    "board key. Win in as few turns as you can: each fight has a par.\n\n"
+    "A CAST  is three picks. PATTERN (1-5): where the light goes, fixed around you; each once "
+    "per turn. SHAPE (Tab): the light only touches that shape and passes through the rest. "
+    "COLOUR (R G B Y C M): what it does. Then aim on the board.\n\n"
+    "GROUPS  Every extra shape one cast fits adds +%d damage to all of them. The Set arrives in "
+    "squads that march in formation: catch a whole set in one cast.\n\n"
+    "COLOURS  Red 3. Green 2 + push. Blue 1 + stun + shield. Yellow 1 + burn + push. Cyan 2 + "
+    "stun + swap. Magenta 4 + splash. Mixes cost both parts. Opposites deal double (R-C, G-M, "
+    "B-Y); an enemy's own colour is absorbed. Colour-blind? Turn on colour symbols in Settings: "
+    "Red |, Green -, Blue /, and a mix wears both its parts' strokes.\n\n"
+    "KEEPERS  change shape every beat (see the strip above them): time your casts."
+) % GROUP_STEP
+
+
+def draw_pattern_legend(surf, x, y, t):
+    """Every pattern, drawn. Enemies attack with these same patterns, so each
+    one you meet is one you could learn."""
+    for i, pt in enumerate(PATTERN_ORDER):
+        oy = y + i * 74
+        box = pygame.Rect(x, oy, 64, 64)
+        pygame.draw.rect(surf, (246, 238, 224), box, border_radius=10)
+        pygame.draw.rect(surf, INK, box, 2, border_radius=10)
+        draw_pattern_icon(surf, pt, box.centerx, box.centery, 6, COLOR_RGB["RGBYCM"[i]])
+        draw_text(surf, font(24), PATTERNS[pt]["name"], (x + 78, oy + 6), INK)
+        draw_wrapped(surf, font(18), PATTERNS[pt]["desc"], (x + 78, oy + 30), 200, DIM, 0)
+    oy = y + len(PATTERN_ORDER) * 74 + 4
+    for i, sh in enumerate(SHAPES):
+        bob = math.sin(t * 3 + i) * 2
+        draw_critter(surf, sh, x + 18 + i * 50, oy + 18 + bob, 14, COLOR_RGB["RGB"[i]],
+                     blink=blink_now(t, i))
+    draw_text(surf, font(18), "light fits one shape", (x + 176, oy + 10), DIM)
 
 
 class HelpScreen(Screen):
-    def __init__(self, app):
+    def __init__(self, app, page="world"):
         super().__init__(app)
-        self.add((380, 584, 200, 40), "Back", app.pop, key=pygame.K_ESCAPE)
+        self.page = page
+        self.backdrop = Backdrop(TITLE_SKY, seed=9, n=18, soft=0.3)
+        self.add((380, 588, 200, 40), "Back", app.pop, key=pygame.K_ESCAPE, tag="back")
+        self.add((330, 20, 140, 36), "The World", lambda: self.show("world"), tag="page:world")
+        self.add((490, 20, 140, 36), "The Rules", lambda: self.show("rules"), tag="page:rules")
+        self.show(page)
+
+    def show(self, page):
+        self.page = page
+        for b in self.buttons:
+            if b.tag.startswith("page:"):
+                b.active = b.tag == "page:" + page
+
+    def handle(self, ev):
+        if ev.type == pygame.KEYDOWN and ev.key in (pygame.K_TAB, pygame.K_LEFT, pygame.K_RIGHT):
+            self.show("rules" if self.page == "world" else "world")
+            return True
+        return super().handle(ev)
+
+    def update(self, dt):
+        self.backdrop.update(dt)
+        return super().update(dt)
 
     def draw(self, surf):
-        surf.fill(BG)
-        f = self.app.fonts
-        draw_text(surf, f[44], "How to play", (40, 24), TEXT)
-        draw_wrapped(surf, f[22], HELP_TEXT, (40, 80), 880, TEXT, spacing=1)
+        self.backdrop.draw(surf)
+        card = draw_card(surf, (30, 70, 900, 505))
+        if self.page == "world":
+            draw_wrapped(surf, font(22), HELP_WORLD, (card.x + 24, card.y + 20), 560, INK, spacing=1)
+            # the climb, drawn
+            draw_tower(surf, (card.right - 290, card.y + 20, 250, 460), 1, self.t)
+        else:
+            draw_wrapped(surf, font(21), HELP_RULES, (card.x + 24, card.y + 18), 560, INK, spacing=1)
+            draw_pattern_legend(surf, card.right - 296, card.y + 14, self.t)
+        draw_text(surf, font(18), "Tab switches pages", (card.right - 14, card.bottom - 22), DIM,
+                  right=True)
+        self.draw_buttons(surf)
+
+
+# ------------------------------------------------------------- settings
+
+class SettingsScreen(Screen):
+    """Colour symbols (for colour-blind players), sound, volume, fullscreen."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.backdrop = Backdrop(TITLE_SKY, seed=17, n=16, soft=0.3)
+        self.build()
+
+    def build(self):
+        S = SETTINGS
+        self.buttons = []
+        onoff = lambda v: "On" if v else "Off"
+        self.add((340, 150, 280, 40), "Colour-blind mode: " + onoff(S["marks"]),
+                 lambda: self.flip("marks"), tag="opt:marks", active=S["marks"], key=pygame.K_1)
+        self.add((360, 290, 240, 40), "Sound: " + onoff(S["sound"]), lambda: self.flip("sound"),
+                 tag="opt:sound", active=S["sound"], key=pygame.K_2)
+        self.add((360, 340, 56, 40), "-", lambda: self.volume(-0.1), tag="vol-", key=pygame.K_MINUS)
+        self.add((544, 340, 56, 40), "+", lambda: self.volume(0.1), tag="vol+", key=pygame.K_EQUALS)
+        self.add((360, 400, 240, 38), "Fullscreen: " + onoff(S["fullscreen"]),
+                 lambda: self.flip("fullscreen"), tag="opt:fullscreen", active=S["fullscreen"],
+                 key=pygame.K_3)
+        self.add((320, 444, 320, 38), "Every Meadow zone open: " + onoff(S["open_zones"]),
+                 lambda: self.flip("open_zones"), tag="opt:open_zones", active=S["open_zones"], key=pygame.K_4)
+        self.add((360, 488, 240, 38), "Towers in your world...", self.gallery, tag="gallery", key=pygame.K_5)
+        self.add((380, 560, 200, 42), "Back", self.app.pop, key=pygame.K_ESCAPE, tag="back")
+
+    def gallery(self):
+        from .gallery import GalleryScreen
+        self.app.push(GalleryScreen(self.app))
+
+    def flip(self, key):
+        SETTINGS[key] = not SETTINGS[key]
+        self.app.apply_settings(refresh_window=(key == "fullscreen"))
+        sound.play("ui")
+        self.build()
+
+    def volume(self, d):
+        SETTINGS["volume"] = round(max(0.0, min(1.0, SETTINGS["volume"] + d)), 2)
+        self.app.apply_settings()
+        sound.play("cast:G")
+        self.build()
+
+    def update(self, dt):
+        self.backdrop.update(dt)
+        return super().update(dt)
+
+    def draw(self, surf):
+        self.backdrop.draw(surf)
+        heading(surf, "Settings", (480, 50), 48, center=True)
+        draw_card(surf, (200, 110, 560, 434))
+        draw_text(surf, font(20), "Every colour wears its letter: shapes, buttons, the board.",
+                  (480, 206), DIM, center=True)
+        # what the letters look like
+        for i, c in enumerate(("R", "G", "B", "Y", "C", "M")):
+            x = 300 + i * 72
+            pygame.draw.circle(surf, COLOR_RGB[c], (x, 244), 16)
+            pygame.draw.circle(surf, INK, (x, 244), 16, 2)
+            draw_colour_mark(surf, c, x, 244, 10, force=True)
+        draw_text(surf, font(17), "Red, Green, Blue; and their mixes Yellow (R+G), Cyan (G+B), Magenta (R+B).",
+                  (480, 272), DIM, center=True)
+        vol = SETTINGS["volume"]
+        bar = pygame.Rect(424, 352, 112, 16)
+        pygame.draw.rect(surf, (236, 228, 214), bar, border_radius=8)
+        pygame.draw.rect(surf, GOOD, (bar.x, bar.y, int(bar.w * vol), bar.h), border_radius=8)
+        pygame.draw.rect(surf, INK, bar, 2, border_radius=8)
+        draw_text(surf, font(18), "volume %d%%" % round(vol * 100), (480, 386), DIM, center=True)
         self.draw_buttons(surf)
 
 
 # ----------------------------------------------------------------- route
 
-KIND_STYLE = {
-    "fight": ("F", (200, 90, 90)), "elite": ("E", (230, 140, 60)),
-    "shop": ("$", (230, 200, 80)), "rest": ("R", (100, 200, 130)),
-    "event": ("?", (150, 130, 230)), "boss": ("B", (230, 70, 200)),
-}
-KIND_LABEL = {
-    "fight": "Fight", "elite": "Elite fight", "shop": "Shop", "rest": "Rest site",
-    "event": "Event", "boss": "Boss",
-}
+TRAVEL_TIME = 0.65
 
 
 class RouteScreen(Screen):
+    """The floor map. You stand on the node you last finished and walk to
+    the next one. Picking a room starts building it on a worker thread while
+    your token travels, so slow room generation is hidden behind the walk."""
+
     def __init__(self, app, notice=""):
         super().__init__(app)
         self.run = app.run
-        self.pos = {}
+        self.act = self.run.act
+        self.style = self.run.place()
+        self.keeper = self.run.keeper()
+        self.backdrop = Backdrop.for_run(self.run, n=20)
         layers = self.run.route.layers
         n = len(layers)
+        self.map_rect = pygame.Rect(190, 104, 748, 462)
+        self.pos = {}
+        x_first, x_last = 342, 790
         for li, layer in enumerate(layers):
-            x = 110 + li * (740 / (n - 1))
+            x = x_first + li * (x_last - x_first) / max(1, n - 1)
             for i in range(len(layer)):
-                y = 300 + (i - (len(layer) - 1) / 2) * 110
+                y = self.map_rect.centery + 6 + (i - (len(layer) - 1) / 2) * 122
                 self.pos[(li, i)] = (int(x), int(y))
+        self.start = (248, self.map_rect.centery + 6)
+        self.door = (880, self.map_rect.centery + 6)
+        self.here = self.start if self.run.layer < 0 else self.pos[(self.run.layer, self.run.node)]
+        self.choices = list(self.run.choices())
+        self.sel = 0
+        self.travel = None
         self.confirm = False
-        for order, (idx, node) in enumerate(self.run.choices()):
-            li = self.run.layer + 1
-            cx, cy = self.pos[(li, idx)]
-            self.add((cx - 30, cy - 30, 60, 60), "", lambda i=idx: app.enter_node(i),
+        for order, (idx, node) in enumerate(self.choices):
+            cx, cy = self.pos[(self.run.layer + 1, idx)]
+            self.add((cx - 32, cy - 32, 64, 64), "", lambda i=idx: self.go(i),
                      key=pygame.K_1 + order, tag="node")
-        self.abandon = self.add((24, 592, 170, 36), "Abandon run", self.on_abandon)
+        self.abandon = self.add((18, 596, 150, 34), "Abandon run", self.on_abandon, tag="abandon",
+                                small=True)
         if notice:
             self.say(notice, GOOD)
+
+    # -- travel
+    def go(self, idx):
+        if self.travel is not None:
+            return
+        if idx not in [i for i, _ in self.choices]:
+            self.say("You can't reach that room from here.", BAD)
+            return
+        job = {"node": None, "error": None}
+
+        def build():
+            try:
+                job["node"] = self.run.enter(idx)
+            except Exception as e:      # surfaced on the main thread in finish_travel
+                job["error"] = e
+
+        # everything the walk needs is captured now: the worker thread is
+        # about to change run.layer / run.node, so drawing must not read them
+        sound.play("step")
+        th = threading.Thread(target=build, daemon=True)
+        self.travel = {"idx": idx, "t": 0.0, "to": self.pos[(self.run.layer + 1, idx)],
+                       "frm": self.here, "thread": th, "job": job,
+                       "kind": self.run.route.layers[self.run.layer + 1][idx].kind,
+                       "layer": self.run.layer}
+        th.start()
+        self.app.dirty = True
+
+    def finish_travel(self):
+        tr = self.travel
+        tr["thread"].join()
+        if tr["job"]["error"] is not None:
+            raise tr["job"]["error"]
+        self.travel = None
+        self.app.show_node(tr["job"]["node"])
 
     def on_abandon(self):
         if not self.confirm:
             self.confirm = True
-            self.abandon.label = "Click again to abandon"
-            self.say("Abandoning ends this run. Click again to confirm.", WARN)
+            self.abandon.label = "Click to confirm"
+            self.say("Abandoning lets the Set sort you back. Click again to confirm.", WARN)
         else:
             self.app.abandon_run()
 
     def draw_buttons(self, surf):
-        f = self.app.fonts[22]
+        f = font(22)
         for b in self.buttons:
             if b.tag != "node":
                 b.draw(surf, f, hover=(b is self.hover))
 
     def handle(self, ev):
-        if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
-            if self.confirm:
-                self.confirm = False
-                self.abandon.label = "Abandon run"
-                self.say("Cancelled.", DIM)
-            else:
-                self.say("Pick a glowing node to continue.", DIM)
-            return True
+        if self.travel is not None:
+            if ev.type in (pygame.KEYDOWN, pygame.MOUSEBUTTONDOWN):
+                self.finish_travel()
+                return True
+            return False
+        if ev.type == pygame.KEYDOWN:
+            if ev.key == pygame.K_ESCAPE:
+                if self.confirm:
+                    self.confirm = False
+                    self.abandon.label = "Abandon run"
+                    self.say("Cancelled.", DIM)
+                else:
+                    self.say("Pick a bouncing room to continue.", DIM)
+                return True
+            if ev.key in (pygame.K_UP, pygame.K_LEFT, pygame.K_w, pygame.K_a) and self.choices:
+                self.sel = (self.sel - 1) % len(self.choices)
+                return True
+            if ev.key in (pygame.K_DOWN, pygame.K_RIGHT, pygame.K_s, pygame.K_d) and self.choices:
+                self.sel = (self.sel + 1) % len(self.choices)
+                return True
+            if ev.key in (pygame.K_RETURN, pygame.K_SPACE) and self.choices:
+                self.go(self.choices[self.sel][0])
+                return True
+        if ev.type == pygame.MOUSEMOTION:
+            for k, b in enumerate(b for b in self.buttons if b.tag == "node"):
+                if b.rect.collidepoint(ev.pos):
+                    self.sel = k
         return super().handle(ev)
 
+    def update(self, dt):
+        self.backdrop.update(dt)
+        tr = self.travel
+        if tr is not None:
+            tr["t"] += dt
+            if tr["t"] >= TRAVEL_TIME and not tr["thread"].is_alive():
+                self.finish_travel()
+        return super().update(dt)
+
+    # -- drawing
+    def _dotted(self, surf, a, b, color, done, phase=0.0):
+        dist = math.hypot(b[0] - a[0], b[1] - a[1])
+        n = max(2, int(dist / 16))
+        for k in range(n + 1):
+            f = (k + phase) / n
+            if f > 1:
+                continue
+            x, y = a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f
+            pygame.draw.circle(surf, INK, (int(x), int(y) + 2), 6 if done else 5)
+            pygame.draw.circle(surf, color, (int(x), int(y)), 5 if done else 4)
+
     def draw(self, surf):
-        surf.fill(BG)
-        f = self.app.fonts
+        t = self.t
         run = self.run
+        style = self.style
+        self.backdrop.draw(surf)
+        heading(surf, style["name"].upper(), (190, 16), 48)
+        draw_text(surf, font(22), style["blurb"], (192, 62), WHITE, shadow=INK)
+        # stats
         p = run.player
-        draw_text(surf, f[32], "Act %d" % run.act, (24, 16), TEXT)
-        draw_text(surf, f[22], "HP %d/%d   Gold %d   Seed %d" % (p.hp, p.max_hp, run.gold, run.seed),
-                  (140, 22), DIM)
+        x = 632
+        form = run.form()
+        x = stat_chip(surf, x, 20, lambda s, cx, cy: draw_player(s, form["shape"], cx, cy, 8, t,
+                                                                 shadow=False), form["name"]) + 8
+        x = stat_chip(surf, x, 20, heart_icon, "%d/%d" % (p.hp, p.max_hp)) + 8
+        stat_chip(surf, x, 20, glint_icon, "%d" % run.gold)
+        # the tower (where this floor sits in the whole climb)
+        draw_card(surf, (14, 104, 164, 462), (255, 250, 238, ), 14)
+        if run.tower:
+            draw_text(surf, font(20), style["name"], (96, 118), INK, center=True)
+            from .towers_art import draw_tower_art
+            friend = TOWERS[run.tower]["friend"]
+            surf.set_clip(pygame.Rect(18, 134, 156, 428))
+            again = getattr(run, "again", False)        # (its friend's out already: nobody at the window)
+            draw_tower_art(surf, run.tower, 96, 526, 2, t,
+                           friend=None if again else (friend["was"], COLOR_RGB[friend["color"]]))
+            surf.set_clip(None)
+            draw_text(surf, font(18), "up to the window", (96, 540), DIM, center=True)
+        else:
+            draw_text(surf, font(22), "The Sorter", (96, 118), INK, center=True)
+            draw_tower(surf, (20, 130, 152, 430), self.act, t)
+        # the floor itself: a tray of tiles
+        mr = self.map_rect
+        draw_card(surf, mr, style["tiles"][0], 18)
+        inner = mr.inflate(-24, -24)
+        for gx in range(inner.x, inner.right - 30, 46):
+            for gy in range(inner.y, inner.bottom - 30, 46):
+                pygame.draw.rect(surf, style["tiles"][1], (gx + 2, gy + 2, 42, 42), border_radius=6)
         layers = run.route.layers
-        valid = {run.layer + 1: [i for i, _ in run.choices()]}
+        valid = {i for i, _ in self.choices}
+        here_layer = self.travel["layer"] if self.travel else run.layer
+        path_col = style["accent"]
+        faint = mix(style["tiles"][1], INK, 0.18)
+        # paths
+        for i in range(len(layers[0])):
+            done = (0, i) in run.visited
+            self._dotted(surf, self.start, self.pos[(0, i)], path_col if done else faint, done)
         for li, layer in enumerate(layers[:-1]):
             for i, node in enumerate(layer):
                 for j in node.nexts:
-                    a, b = self.pos[(li, i)], self.pos[(li + 1, j)]
-                    on_path = (li, i) in run.visited and (li + 1, j) in run.visited
-                    pygame.draw.line(surf, ACCENT if on_path else (60, 64, 90), a, b, 3 if on_path else 2)
-        tick = pygame.time.get_ticks() / 400.0
+                    done = (li, i) in run.visited and (li + 1, j) in run.visited
+                    self._dotted(surf, self.pos[(li, i)], self.pos[(li + 1, j)],
+                                 path_col if done else faint, done)
+        boss_pos = self.pos[(len(layers) - 1, 0)]
+        self._dotted(surf, boss_pos, (self.door[0] - 34, self.door[1]), faint, False)
+        # live paths from where you stand glow and march
+        if self.travel is None:
+            for k, (idx, _n) in enumerate(self.choices):
+                tgt = self.pos[(run.layer + 1, idx)]
+                self._dotted(surf, self.here, tgt, SUNNY if k == self.sel else WHITE, True,
+                             phase=(t * 1.5) % 1)
+        # start slot and exit door
+        came_in = "circle" if run.tower else {1: "triangle", 2: "square", 3: "pentagon"}[self.act]
+        draw_slot(surf, came_in, self.start[0], self.start[1] + 30, 24, style["wall"])
+        draw_text(surf, font(18), "your slot" if self.act == 1 and not run.tower else "you came in here",
+                  (self.start[0], self.start[1] + 62), INK, center=True)
+        if run.tower:                     # the goal here is a window, and who's waiting at it
+            from .towers_art import draw_tower_art
+            draw_tower_art(surf, run.tower, self.door[0], self.door[1] + 64, 1, t)
+            draw_text(surf, font(18), "the window", (self.door[0], self.door[1] + 74), INK,
+                      center=True)
+        else:
+            draw_exit_door(surf, style, self.door[0], self.door[1], 28, t)
+            draw_text(surf, font(18), style["door_name"], (self.door[0], self.door[1] + 58), INK,
+                      center=True)
+            draw_text(surf, font(18), "(needs %s)" % {"square": "4 sides", "pentagon": "5 sides",
+                                                      "circle": "roundness"}[style["door"]],
+                      (self.door[0], self.door[1] + 74), DIM, center=True)
+        # nodes
+        hover_node = None
         for li, layer in enumerate(layers):
             for i, node in enumerate(layer):
-                glyph, col = KIND_STYLE[node.kind]
                 cx, cy = self.pos[(li, i)]
-                reachable = li in valid and i in valid[li]
+                reachable = li == here_layer + 1 and i in valid and self.travel is None
                 visited = (li, i) in run.visited
-                r = 24 if node.kind != "boss" else 30
-                pygame.draw.circle(surf, col if (reachable or visited) else tuple(c // 3 for c in col), (cx, cy), r)
+                future = li > here_layer
+                r = 30 if node.kind != "boss" else 38
                 if reachable:
-                    pulse = int(4 + 3 * math.sin(tick))
-                    pygame.draw.circle(surf, TEXT, (cx, cy), r + pulse, 2)
-                if visited and (li, i) == (run.layer, run.node):
-                    pygame.draw.circle(surf, GOOD, (cx, cy), r + 6, 3)
-                draw_text(surf, f[32], glyph, (cx, cy), BG, center=True)
-        draw_text(surf, f[18], "F fight  E elite  $ shop  R rest  ? event  B boss.  Click a glowing node or press 1-%d."
-                  % max(1, len(run.choices())), (24, 540), DIM)
+                    k = [c[0] for c in self.choices].index(i)
+                    cy += int(-abs(math.sin(t * 3.2 + k)) * 7)
+                    if k == self.sel:
+                        hover_node = (node.kind, cx, cy)
+                ring = node_color(node.kind, t)
+                faded = not (reachable or visited or (future and node.kind == "boss"))
+                if faded:
+                    ring = mix(ring, style["tiles"][0], 0.7)
+                pygame.draw.circle(surf, INK, (cx, cy + 4), r)
+                pygame.draw.circle(surf, PAPER if not faded else style["tiles"][0], (cx, cy), r)
+                pygame.draw.circle(surf, ring, (cx, cy), r, 6)
+                pygame.draw.circle(surf, INK, (cx, cy), r, 3)
+                if reachable and k == self.sel:
+                    pygame.draw.circle(surf, SUNNY, (cx, cy), r + 7 + int(2 * math.sin(t * 6)), 4)
+                draw_node_icon(surf, node.kind, cx, cy, r - 6, self.keeper, t, faded=faded)
+                if reachable:
+                    badge = (cx + r - 4, cy - r + 4)
+                    pygame.draw.circle(surf, INK, badge, 11)
+                    draw_text(surf, font(20), str(k + 1), badge, WHITE, center=True)
+                if reachable or node.kind == "boss":
+                    draw_text(surf, font(18), node_title(node.kind, self.keeper), (cx, cy + r + 14),
+                              INK, center=True)
+        # you
+        if self.travel is not None:
+            tr = self.travel
+            f = min(1.0, tr["t"] / TRAVEL_TIME)
+            e = ease_out(f)
+            (ax, ay), (bx, by) = tr["frm"], tr["to"]
+            px, py = ax + (bx - ax) * e, ay + (by - ay) * e
+            hop = abs(math.sin(f * math.pi * 3)) * 16
+            tilt = math.sin(f * math.pi * 3) * 0.25
+            draw_player(surf, form["shape"], px, py - 38 - hop, 16, t, look=(1, 0), rot=tilt)
+            if f >= 1 and tr["kind"] in ("fight", "elite", "boss"):
+                heading(surf, "the Set is gathering...", (px, py - 78), 20, center=True)
+        else:
+            hx, hy = self.here
+            bob = math.sin(t * 2.5) * 2
+            tgt = self.pos[(run.layer + 1, self.choices[self.sel][0])] if self.choices else (hx + 1, hy)
+            look = ((tgt[0] - hx) / 120.0, (tgt[1] - hy) / 160.0)
+            draw_player(surf, form["shape"], hx, hy - 40 + bob, 16, t, look=look,
+                        blink=blink_now(t, 1))
+        # tooltip for the selected room
+        if hover_node is not None and self.travel is None:
+            kind, cx, cy = hover_node
+            tip = pygame.Rect(0, 0, 270, 86)
+            tip.midleft = (cx + 44, cy)          # beside the room, never over you
+            tip.clamp_ip(mr.inflate(-8, -8))
+            draw_card(surf, tip, PAPER, 10, 4)
+            draw_text(surf, font(22), node_title(kind, self.keeper), (tip.x + 10, tip.y + 8), INK)
+            draw_wrapped(surf, font(18), node_blurb(kind, self.keeper), (tip.x + 10, tip.y + 30),
+                         tip.w - 20, DIM)
+        # footer
         if run.relics:
-            draw_text(surf, f[18], "Relics: " + ", ".join(RELICS[r]["name"] for r in run.relics),
-                      (24, 562), WARN)
-        draw_text(surf, f[22], self.msg, (24, 70), self.msg_color)
+            x = 190
+            draw_text(surf, font(20), "Facets:", (x, 580), WHITE, shadow=INK)
+            x += 70
+            for rid in run.relics:
+                rel = RELICS[rid]
+                draw_facet(surf, rid, x + 8, 589, 9, self.t)
+                r = draw_text(surf, font(18), rel["name"], (x + 20, 582), WHITE, shadow=INK)
+                x = r.right + 14
+        keys = "1" if len(self.choices) <= 1 else "1-%d" % len(self.choices)
+        hint = ("Fights make you stronger; calm rooms spend it. Every way up has at least 3 fights. "
+                "Click a room or press %s." % keys)
+        draw_text(surf, font(18), hint, (190, 610), WHITE, shadow=INK)
+        if self.msg:
+            draw_text(surf, font(22), self.msg, (936, 80), WHITE, right=True, shadow=INK)
         self.draw_buttons(surf)
-
-
-# ---------------------------------------------------------------- combat
-
-KEY_MOVES = {
-    pygame.K_UP: (0, -1), pygame.K_w: (0, -1), pygame.K_RIGHT: (1, 0), pygame.K_d: (1, 0),
-    pygame.K_DOWN: (0, 1), pygame.K_s: (0, 1), pygame.K_LEFT: (-1, 0), pygame.K_a: (-1, 0),
-}
-KEY_SHAPES = {pygame.K_1: "triangle", pygame.K_2: "square", pygame.K_3: "circle"}
-KEY_COLORS = {pygame.K_r: "R", pygame.K_g: "G", pygame.K_b: "B",
-              pygame.K_y: "Y", pygame.K_c: "C", pygame.K_m: "M"}
-
-
-def _lerp(a, b, t):
-    return a + (b - a) * t
-
-
-class CombatScreen(Screen):
-    def __init__(self, app, run):
-        super().__init__(app)
-        self.run = run
-        self.state = run.state
-        self.queue = []
-        self.shape = "triangle"
-        self.color = None
-        self.tool = "move"
-        self.tile_hover = None
-        self.mode = "plan"          # "plan" | "anim"
-        self.anim = None
-        self.last_summary = ""
-        self.refresh()
-        self.say("Plan up to %d beats, then press Resolve (Enter)." % BEATS, DIM)
-
-    # -- state helpers
-    def draw_buttons(self, surf):
-        f = self.app.fonts[22]
-        for b in self.buttons:
-            if not b.tag.startswith("slot"):
-                b.draw(surf, f, hover=(b is self.hover))
-
-    def refresh(self):
-        self.cur, _ = rules.simulate_prefix(self.state, self.queue)
-        self.pre, self.pre_events = rules.preview_full(self.state, self.queue)
-        self.build_buttons()
-        self.app.dirty = True
-
-    def tile_rect(self, gx, gy):
-        return pygame.Rect(OX + gx * CELL, OY + gy * CELL, CELL, CELL)
-
-    def tile_at(self, pos):
-        gx, gy = (pos[0] - OX) // CELL, (pos[1] - OY) // CELL
-        if 0 <= gx < GRID_W and 0 <= gy < GRID_H and pos[0] >= OX and pos[1] >= OY:
-            return int(gx), int(gy)
-        return None
-
-    # -- buttons
-    def build_buttons(self):
-        self.buttons = []
-        plan = self.mode == "plan"
-        px = 552
-        for i, s in enumerate(SHAPES):
-            self.add((px + i * 126, 208, 120, 32), "%d %s" % (i + 1, SHAPE_NAMES[s]),
-                     lambda s=s: self.pick_shape(s), enabled=plan, key=None,
-                     active=(self.shape == s and self.tool == "cast"), tag="shape:" + s)
-        pl = self.cur.player
-        for i, c in enumerate(COLORS):
-            x, y = px + (i % 3) * 126, 264 + (i // 3) * 38
-            cost = "+".join(COMPONENTS[c])
-            name = COLOR_NAMES[c] if c in PRIMARIES else "%s %s" % (COLOR_NAMES[c], cost)
-            ok = plan and rules.can_afford(pl, c)
-            self.add((x, y, 120, 32), name, lambda c=c: self.pick_color(c),
-                     enabled=ok, chip=COLOR_RGB[c], active=(self.color == c and self.tool == "cast"),
-                     tag="color:" + c, small=True)
-        self.add((px, 346, 90, 34), "Move", self.pick_move, enabled=plan,
-                 active=(self.tool == "move"), tag="tool_move")
-        self.add((px + 96, 346, 90, 34), "Wait", lambda: self.queue_action(wait()), enabled=plan,
-                 key=None, tag="wait")
-        self.add((px + 192, 346, 90, 34), "Undo", self.undo, enabled=plan and bool(self.queue),
-                 tag="undo")
-        self.add((px + 288, 346, 88, 34), "Clear", self.clear, enabled=plan and bool(self.queue),
-                 tag="clear")
-        n = len(self.queue)
-        label = "Resolve turn (Enter)" if n == BEATS else (
-            "Pass turn (Enter)" if n == 0 else "Resolve %d beat%s, rest wait" % (n, "s" if n != 1 else ""))
-        self.add((px, 390, 376, 44), label, self.resolve, enabled=plan, tag="resolve",
-                 color=(70, 110, 80))
-        self.add((px + 300, 16, 76, 28), "Help", lambda: self.app.push(HelpScreen(self.app)),
-                 tag="help", key=pygame.K_h)
-        for i in range(BEATS):
-            self.add(self.slot_rect(i), "", lambda i=i: self.cut_to(i), enabled=plan and i < len(self.queue),
-                     tag="slot%d" % i, color=PANEL)
-
-    def slot_rect(self, i):
-        return pygame.Rect(OX + i * 126, 580, 120, 50)
-
-    # -- actions
-    def pick_shape(self, s):
-        self.shape = s
-        self.tool = "cast"
-        if self.color is None:
-            self.say("%s selected: %s. Now pick a colour." % (SHAPE_NAMES[s], SHAPE_DESC[s]), ACCENT)
-        else:
-            self.say("%s %s: click a target tile." % (COLOR_NAMES[self.color], SHAPE_NAMES[s]), ACCENT)
-        self.build_buttons()
-
-    def pick_color(self, c):
-        self.color = c
-        self.tool = "cast"
-        self.say("%s (%s): %s. Click a target tile." % (COLOR_NAMES[c], "+".join(COMPONENTS[c]),
-                                                       COLOR_EFFECT[c]), ACCENT)
-        self.build_buttons()
-
-    def pick_move(self):
-        self.tool = "move"
-        self.say("Move tool: click a tile next to you, or use the arrow keys.", DIM)
-        self.build_buttons()
-
-    def cancel_selection(self):
-        if self.tool == "cast" or self.color is not None:
-            self.color = None
-            self.tool = "move"
-            self.say("Cast cancelled.", DIM)
-        else:
-            self.say("Nothing to cancel.", DIM)
-        self.build_buttons()
-
-    def queue_action(self, a):
-        if self.mode != "plan":
-            return False
-        if len(self.queue) >= BEATS:
-            self.say("Timeline is full. Resolve (Enter) or Undo a beat.", BAD)
-            return False
-        ok, msg = rules.validate_action(self.cur, a)
-        if not ok:
-            self.say(msg, BAD)
-            return False
-        self.queue.append(a)
-        self.refresh()
-        self.say("Beat %d: %s." % (len(self.queue), a.describe()), GOOD)
-        return True
-
-    def undo(self):
-        if self.mode != "plan":
-            return
-        if not self.queue:
-            self.say("Nothing to undo.", DIM)
-            return
-        a = self.queue.pop()
-        self.refresh()
-        self.say("Removed beat %d (%s)." % (len(self.queue) + 1, a.describe()), DIM)
-
-    def clear(self):
-        if self.mode != "plan":
-            return
-        if not self.queue:
-            self.say("The timeline is already empty.", DIM)
-            return
-        self.queue = []
-        self.refresh()
-        self.say("Timeline cleared.", DIM)
-
-    def cut_to(self, i):
-        if self.mode != "plan" or i >= len(self.queue):
-            return
-        self.queue = self.queue[:i]
-        self.refresh()
-        self.say("Plan cut back to %d beat%s." % (i, "" if i == 1 else "s"), DIM)
-
-    def resolve(self):
-        if self.mode != "plan":
-            return
-        before = rules.snapshot(self.state)
-        hp_before = self.state.player.hp
-        foes_before = sum(e.hp + e.shield for e in self.state.enemies)
-        res = rules.resolve_turn(self.state, self.queue, advance=True, record=True)
-        foes_after = sum(e.hp + e.shield for e in self.state.enemies)
-        self.last_summary = "Turn done: you took %d, enemies lost %d." % (
-            max(0, hp_before - self.state.player.hp), max(0, foes_before - foes_after))
-        self.anim = {"snaps": [before] + res.snapshots, "events": res.events,
-                     "i": 0, "t": 0.0, "outcome": res.outcome}
-        self.mode = "anim"
-        self.queue = []
-        self.build_buttons()
-        self.app.dirty = True
-
-    def finish_anim(self):
-        outcome = self.anim["outcome"]
-        self.anim = None
-        self.mode = "plan"
-        self.refresh()
-        if outcome == "victory":
-            self.app.combat_won()
-        elif outcome == "defeat":
-            self.app.combat_lost()
-        else:
-            self.say("%s Turn %d: plan your beats." % (self.last_summary, self.state.turn), DIM)
-
-    def skip_anim(self):
-        if self.mode == "anim":
-            self.finish_anim()
-
-    # -- input
-    def board_click(self, tile):
-        gx, gy = tile
-        if self.tool == "cast" and self.color is not None:
-            self.queue_action(cast(self.shape, self.color, gx, gy))
-            return
-        p = self.cur.player
-        dx, dy = gx - p.x, gy - p.y
-        if abs(dx) + abs(dy) == 1:
-            self.queue_action(move(dx, dy))
-        elif (dx, dy) == (0, 0):
-            self.say("That is you. Pick a colour to cast, or click an adjacent tile to move.", DIM)
-        else:
-            self.say("Move one tile at a time, or pick a colour to cast.", DIM)
-
-    def handle(self, ev):
-        if self.mode == "anim":
-            if ev.type in (pygame.KEYDOWN, pygame.MOUSEBUTTONDOWN):
-                self.skip_anim()
-                return True
-            return False
-        if ev.type == pygame.MOUSEMOTION:
-            t = self.tile_at(ev.pos)
-            if t != self.tile_hover:
-                self.tile_hover = t
-                self.app.dirty = True
-        elif ev.type == pygame.MOUSEBUTTONDOWN:
-            if ev.button == 3:
-                self.cancel_selection()
-                return True
-            if ev.button == 1:
-                b = self.button_at(ev.pos)
-                if b is not None:
-                    b.click()
-                    self.app.dirty = True
-                    return True
-                tile = self.tile_at(ev.pos)
-                if tile is not None:
-                    self.board_click(tile)
-                    return True
-        elif ev.type == pygame.KEYDOWN:
-            if self.key(ev.key):
-                return True
-        return super().handle(ev)
-
-    def key(self, k):
-        if k in KEY_MOVES:
-            self.queue_action(move(*KEY_MOVES[k]))
-        elif k in KEY_SHAPES:
-            self.pick_shape(KEY_SHAPES[k])
-        elif k in KEY_COLORS:
-            c = KEY_COLORS[k]
-            if rules.can_afford(self.cur.player, c):
-                self.pick_color(c)
-            else:
-                self.say("Not enough charges for %s." % COLOR_NAMES[c], BAD)
-        elif k == pygame.K_SPACE:
-            self.queue_action(wait())
-        elif k in (pygame.K_BACKSPACE, pygame.K_z):
-            self.undo()
-        elif k == pygame.K_x:
-            self.clear()
-        elif k == pygame.K_RETURN:
-            self.resolve()
-        elif k == pygame.K_ESCAPE:
-            self.cancel_selection()
-        else:
-            return False
-        return True
-
-    def update(self, dt):
-        if self.mode != "anim":
-            return False
-        a = self.anim
-        a["t"] += dt
-        while a["t"] >= BEAT_TIME:
-            a["t"] -= BEAT_TIME
-            a["i"] += 1
-            if a["i"] >= len(a["snaps"]) - 1:
-                self.finish_anim()
-                return True
-        return True
-
-    # -- drawing
-    def view(self):
-        """(positions/hp for drawing, t, beat index, events) for plan or anim."""
-        if self.mode == "anim":
-            a = self.anim
-            i = min(a["i"], len(a["snaps"]) - 2)
-            return a["snaps"][i], a["snaps"][i + 1], a["t"] / BEAT_TIME, i
-        snap = rules.snapshot(self.state)
-        return snap, snap, 0.0, -1
-
-    def cell_center(self, x, y):
-        return OX + int((x + 0.5) * CELL), OY + int((y + 0.5) * CELL)
-
-    def draw_enemy(self, surf, kind, x, y, hp, max_hp, color, shield, stun, burn, ghost=False,
-                   alpha_scale=1.0):
-        spec = KINDS[kind]
-        cx, cy = self.cell_center(x, y)
-        r = 22 if is_boss(kind) else 17
-        rgb = COLOR_RGB[color]
-        if ghost:
-            draw_shape(surf, spec["shape"], int(cx), int(cy), r, BG, outline=rgb, width=2)
-            return
-        draw_shape(surf, spec["shape"], int(cx), int(cy), r, tuple(int(c * alpha_scale) for c in rgb),
-                   outline=TEXT if is_boss(kind) else BG, width=2)
-        f = self.app.fonts
-        draw_text(surf, f[18], spec["label"][0], (int(cx), int(cy)), BG, center=True)
-        draw_text(surf, f[18], "%d" % hp, (int(cx), int(cy) + r + 6), TEXT, center=True)
-        if shield:
-            pygame.draw.circle(surf, (120, 170, 255), (int(cx), int(cy)), r + 4, 2)
-        if stun:
-            draw_text(surf, f[18], "Z", (int(cx) + r, int(cy) - r - 4), WARN, center=True)
-        if burn:
-            draw_text(surf, f[18], "~", (int(cx) - r, int(cy) - r - 4), (255, 140, 60), center=True)
-
-    def draw_player(self, surf, x, y, shield, ghost=False):
-        cx, cy = self.cell_center(x, y)
-        cx, cy = int(cx), int(cy)
-        pts = [(cx, cy - 20), (cx + 18, cy), (cx, cy + 20), (cx - 18, cy)]
-        if ghost:
-            pygame.draw.polygon(surf, TEXT, pts, 1)
-            return
-        pygame.draw.polygon(surf, (236, 238, 250), pts)
-        pygame.draw.circle(surf, (60, 70, 120), (cx, cy), 6)
-        if shield:
-            pygame.draw.circle(surf, (120, 170, 255), (cx, cy), 24, 2)
-
-    def draw_board(self, surf):
-        for gy in range(GRID_H):
-            for gx in range(GRID_W):
-                r = self.tile_rect(gx, gy)
-                if (gx, gy) in self.state.board.walls:
-                    pygame.draw.rect(surf, WALL, r)
-                    pygame.draw.rect(surf, (110, 116, 142), r.inflate(-10, -10), 2)
-                else:
-                    pygame.draw.rect(surf, GRID_A if (gx + gy) % 2 == 0 else GRID_B, r)
-        a, b, t, seg = self.view()
-        if self.mode == "plan":
-            self.draw_plan_overlay(surf)
-        else:
-            self.draw_anim_overlay(surf, seg, t)
-        # enemies
-        prev = {e[0]: e for e in a["enemies"]}
-        nxt = {e[0]: e for e in b["enemies"]}
-        for eid, e in prev.items():
-            n = nxt.get(eid)
-            if n is None:
-                if t < 0.6:
-                    self.draw_enemy(surf, e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8], e[9],
-                                    alpha_scale=1.0 - t)
-                continue
-            x, y = _lerp(e[2], n[2], min(1, t * 1.6)), _lerp(e[3], n[3], min(1, t * 1.6))
-            src = n if t >= 0.5 else e
-            self.draw_enemy(surf, e[1], x, y, src[4], e[5], n[6] if t >= 0.5 else e[6],
-                            src[7], src[8], src[9])
-        for eid, n in nxt.items():
-            if eid not in prev and t >= 0.4:
-                self.draw_enemy(surf, n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8], n[9])
-        pa, pb = a["player"], b["player"]
-        self.draw_player(surf, _lerp(pa[0], pb[0], min(1, t * 1.6)), _lerp(pa[1], pb[1], min(1, t * 1.6)),
-                         (pb if t >= 0.5 else pa)[3])
-
-    def draw_plan_overlay(self, surf):
-        f = self.app.fonts
-        # telegraphed enemy attacks from the exact preview of the queued plan
-        for ev in self.pre_events:
-            if ev["t"] != "enemy_attack":
-                continue
-            for (x, y) in ev["tiles"]:
-                r = self.tile_rect(x, y)
-                tint(surf, r, (255, 150, 40), 80)
-                if ev["hit"]:
-                    pygame.draw.rect(surf, BAD, r, 3)
-                draw_text(surf, f[18], str(ev["beat"] + 1), (r.x + 4, r.y + 2), (255, 220, 160))
-        # where the plan takes you / the enemies
-        p0 = self.state.player
-        path = [self.cell_center(p0.x, p0.y)]
-        for ev in self.pre_events:
-            if ev["t"] == "move" and ev["who"] == "player":
-                path.append(self.cell_center(*ev["to"]))
-            elif ev["t"] == "swap":
-                path.append(self.cell_center(*ev["b"]))
-        if len(path) > 1:
-            pygame.draw.lines(surf, (200, 210, 255), False, path, 2)
-        pp = self.pre.player
-        if (pp.x, pp.y) != (p0.x, p0.y):
-            self.draw_player(surf, pp.x, pp.y, 0, ghost=True)
-        live = {e.id: e for e in self.state.enemies}
-        for e in self.pre.enemies:
-            o = live.get(e.id)
-            if o is not None and (o.x, o.y) != (e.x, e.y):
-                self.draw_enemy(surf, e.kind, e.x, e.y, e.hp, e.max_hp, e.color, 0, 0, 0, ghost=True)
-        # hover
-        t = self.tile_hover
-        if t is None:
-            return
-        if self.tool == "cast" and self.color is not None:
-            tiles = rules.shape_tiles(self.cur, self.shape, *t)
-            if tiles is None:
-                r = self.tile_rect(*t)
-                pygame.draw.line(surf, BAD, r.topleft, r.bottomright, 3)
-                pygame.draw.line(surf, BAD, r.topright, r.bottomleft, 3)
-            else:
-                rgb = COLOR_RGB[self.color]
-                for tx, ty in tiles:
-                    r = self.tile_rect(tx, ty)
-                    tint(surf, r, rgb, 110)
-                    pygame.draw.rect(surf, rgb, r, 2)
-        elif self.tool == "move":
-            p = self.cur.player
-            for dx, dy in ((0, -1), (1, 0), (0, 1), (-1, 0)):
-                if rules.validate_action(self.cur, move(dx, dy))[0]:
-                    tint(surf, self.tile_rect(p.x + dx, p.y + dy), (255, 255, 255), 28)
-
-    def draw_anim_overlay(self, surf, seg, t):
-        events = self.anim["events"]
-        fade = max(0.0, 1.0 - t)
-        for ev in events:
-            if ev.get("beat") != seg:
-                continue
-            if ev["t"] == "cast":
-                rgb = COLOR_RGB[ev["color"]]
-                for (x, y) in ev["tiles"]:
-                    tint(surf, self.tile_rect(x, y), rgb, int(150 * fade))
-            elif ev["t"] == "enemy_attack":
-                for (x, y) in ev["tiles"]:
-                    tint(surf, self.tile_rect(x, y), (255, 120, 40), int(140 * fade))
-                    if ev["hit"]:
-                        pygame.draw.rect(surf, BAD, self.tile_rect(x, y), 3)
-            elif ev["t"] == "dmg" and t > 0.15:
-                x, y = ev["pos"]
-                r = self.tile_rect(x, y)
-                col = BAD if ev["who"] == "player" else TEXT
-                draw_text(surf, self.app.fonts[26], "-%d" % ev["took"], (r.centerx, r.y - int(8 * t)),
-                          col, center=True)
-
-    def draw_panel(self, surf):
-        f = self.app.fonts
-        px = 552
-        a, b, t, seg = self.view()
-        if self.mode == "anim":
-            php, shield = (b if t >= 0.5 else a)["player"][2:4]
-            pal = (b if t >= 0.5 else a)["palette"]
-        else:
-            php, shield = self.state.player.hp, self.state.player.shield
-            pal = self.cur.player.palette
-        p = self.state.player
-        pygame.draw.rect(surf, PANEL, (px - 12, 56, 396, 576), border_radius=8)
-        draw_text(surf, f[26], "HP %d/%d" % (php, p.max_hp), (px, 66), TEXT)
-        pygame.draw.rect(surf, (60, 40, 46), (px + 100, 70, 200, 14), border_radius=4)
-        pygame.draw.rect(surf, BAD, (px + 100, 70, int(200 * max(0, php) / p.max_hp), 14), border_radius=4)
-        draw_text(surf, f[22], "Shield %d" % shield, (px + 310, 68), (140, 180, 255))
-        draw_text(surf, f[22], "Gold %d" % self.run.gold, (px, 98), WARN)
-        draw_text(surf, f[22], "Turn %d" % self.state.turn, (px + 100, 98), DIM)
-        chain = self.cur.player.chain
-        draw_text(surf, f[22], "Chain x%s" % ("%.1f" % ((chain + 1) / 2) if chain else "1"),
-                  (px + 200, 98), ACCENT)
-        draw_text(surf, f[18], "Charges (regen +%d per colour each turn)" % p.mods["regen"], (px, 122), DIM)
-        for i, c in enumerate(PRIMARIES):
-            x = px + i * 126
-            cap = p.cap[c]
-            for k in range(cap):
-                rect = pygame.Rect(x + k * 20, 142, 16, 22)
-                pygame.draw.rect(surf, COLOR_RGB[c] if k < pal[c] else (50, 52, 70), rect, border_radius=3)
-            draw_text(surf, f[18], "%s %d/%d" % (c, pal[c], cap), (x, 167), DIM)
-        draw_text(surf, f[18], "Shape", (px, 190), DIM)
-        draw_text(surf, f[18], "Colour (mixes cost one of each part)", (px, 246), DIM)
-        self.draw_buttons(surf)
-        # message
-        draw_wrapped(surf, f[22], self.msg, (px, 440), 360, self.msg_color)
-        # enemies
-        y = 490
-        draw_text(surf, f[18], "Enemies (own colour is absorbed, opposite colour = double)", (px, y), DIM)
-        y += 20
-        shown = self.state.enemies if self.mode == "plan" else self.state.enemies
-        for e in shown[:6]:
-            spec = KINDS[e.kind]
-            draw_shape(surf, spec["shape"], px + 10, y + 9, 8, COLOR_RGB[e.color])
-            tags = ("  Z" if e.stun else "") + ("  ~burn" if e.burn else "") + ("  +%d sh" % e.shield if e.shield else "")
-            draw_text(surf, f[18], "%s %d/%d  weak: %s%s" % (spec["label"], e.hp, e.max_hp,
-                                                          COLOR_NAMES[OPPOSITE[e.color]], tags),
-                      (px + 26, y), TEXT)
-            y += 20
-        if len(self.state.enemies) > 6:
-            draw_text(surf, f[18], "+%d more" % (len(self.state.enemies) - 6), (px + 26, y), DIM)
-
-    def draw_timeline(self, surf):
-        f = self.app.fonts
-        dmg_by_beat = {}
-        for ev in self.pre_events:
-            if ev["t"] == "dmg" and ev["who"] == "player" and ev["beat"] < BEATS:
-                dmg_by_beat[ev["beat"]] = dmg_by_beat.get(ev["beat"], 0) + ev["took"]
-        for i in range(BEATS):
-            r = self.slot_rect(i)
-            pygame.draw.rect(surf, PANEL_LIGHT if i < len(self.queue) else PANEL, r, border_radius=6)
-            border = ACCENT if (i == len(self.queue) and self.mode == "plan") else (70, 74, 100)
-            pygame.draw.rect(surf, border, r, 2, border_radius=6)
-            draw_text(surf, f[18], "Beat %d" % (i + 1), (r.x + 8, r.y + 4), DIM)
-            if i < len(self.queue):
-                a = self.queue[i]
-                if a.kind == "cast":
-                    pygame.draw.circle(surf, COLOR_RGB[a.color], (r.x + 14, r.y + 34), 7)
-                    draw_text(surf, f[18], "%s" % SHAPE_NAMES[a.shape], (r.x + 26, r.y + 27), TEXT)
-                else:
-                    draw_text(surf, f[18], a.describe(), (r.x + 8, r.y + 27), TEXT)
-            else:
-                draw_text(surf, f[18], "(wait)" if self.mode == "plan" else "", (r.x + 8, r.y + 27), (90, 94, 120))
-            if dmg_by_beat.get(i) and self.mode == "plan":
-                draw_text(surf, f[22], "-%d" % dmg_by_beat[i], (r.right - 8, r.y + 4), BAD, right=True)
-
-    def draw(self, surf):
-        surf.fill(BG)
-        f = self.app.fonts
-        node = self.run.current_kind()
-        draw_text(surf, f[32], "%s  -  Act %d" % (KIND_LABEL.get(node, "Fight"), self.run.act), (OX, 20), TEXT)
-        if self.mode == "plan":
-            draw_text(surf, f[18], "Orange tiles = enemy attacks (number = beat). Red outline = it hits you.",
-                      (OX + 260, 28), DIM)
-        else:
-            draw_text(surf, f[18], "Resolving... click or press a key to skip.", (OX + 260, 28), WARN)
-        self.draw_board(surf)
-        self.draw_timeline(surf)
-        self.draw_panel(surf)

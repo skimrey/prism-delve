@@ -1,0 +1,73 @@
+PRISM DELVE: HOW TO RUN IT
+==========================
+
+You need Python 3.10 or newer. Everything else is one package (pygame-ce).
+Run these from the project folder (the one with this file in it).
+
+
+1. SET UP (once)
+----------------
+    python3 -m venv .venv
+    ./.venv/bin/pip install pygame-ce
+
+  (On Windows, use .venv\Scripts\python and .venv\Scripts\pip instead of ./.venv/bin/...)
+
+
+2. PLAY
+-------
+    ./.venv/bin/python -m prism
+
+  Optional: --seed=123 to play a particular climb again.
+  Your progress is saved in ~/.prism_delve/ (delete that folder to start fresh).
+
+
+3. TEST MODE (jump anywhere, cheats)
+------------------------------------
+    ./.venv/bin/python -m prism --dev
+
+  On a Mac you can double-click play_dev.command instead.
+  In test mode: F1 opens the Dev menu on any screen. It has two tabs:
+    The Sorter         pick a floor, jump into any room or story scene, 99 HP, all patterns...
+    Meadow & towers    how many friends are out (0 to 8 = tower Keepers beaten), your number of
+                       sides (- / + / auto / round), jump to any zone, any tower (climb, intro,
+                       Keeper fight, rescue), any of the eight games, the tower gallery, the
+                       Finale (the Grand Roll), and "All zones open". None of it is saved to
+                       your real progress.
+  Hotkeys: F2 win the fight, F3 lose it, F4 skip to the Keeper, F6 next floor,
+           F7 every pattern, F8 +100 glint, F9 heal.
+
+  Straight into something from the command line:
+    ./.venv/bin/python -m prism --dev --floor=2 --room=boss
+    ./.venv/bin/python -m prism --dev --scene=towerboss --tower=lens
+    ./.venv/bin/python -m prism --dev --scene=hub --at=12000 --rescued=leaning,hollow
+    ./.venv/bin/python -m prism --dev --scene=curl
+    ./.venv/bin/python -m prism --dev --scene=finale
+  Scenes: story ascend roll meadow sorted rolled hub wilds tower towerintro towerboss rescue
+          finale rolloff pinball sporedrop curl duneputt glimmerpop beachbowl skyball
+  Towers: leaning hollow toadstool icicle sundial lens lighthouse windmill
+
+
+4. RUN THE TESTS
+----------------
+    ./.venv/bin/python -m unittest discover -s tests
+
+  (On a machine with no screen or sound card, e.g. a server, put this in front:
+   SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy )
+
+  A screenshot tour of every screen (saved to shots/):
+    ./.venv/bin/python tools/dev_tour.py
+
+
+5. CONTROLS (the short version)
+-------------------------------
+  Fights:    1-5 pick a pattern, Tab the shape, R G B Y C M the colour, click a tile to aim,
+             arrows to move (or roll), Enter to pass the turn, Q/E to step through the beats,
+             K the board key, H help.
+  Meadow:    arrows to roll, Up to hop, Space to talk, M (or Tab) the map, Esc to go back.
+             The map goes to any zone you've reached and climbs any tower you've reached,
+             again and again: a tower's floors are freshly shuffled every climb. Or talk to a
+             tower's Keeper by its open door. New Run lets you start on any Sorter floor you've
+             reached.
+  Games:     each game shows its keys on its left panel. Esc always goes back.
+  Settings:  O on the title screen. Colour-blind mode (a letter on every colour), sound,
+             fullscreen, every Meadow zone open, and which towers are in your world.

@@ -11,7 +11,7 @@ from helpers import make_state
 
 from prism import rules
 from prism.consts import GRID_H, GRID_W, PLAYER_START, RELICS
-from prism.dungeon import (NODE_KINDS, REQUIRED_PATHS, build_combat, distinct_paths,
+from prism.dungeon import (NODE_KINDS, REQUIRED_PATHS, _solve_kw, build_combat, distinct_paths,
                            generate_route, make_walls)
 from prism.enemies import BOSS_FOR_ACT, KINDS
 from prism.run import ACTS, EVENTS, Meta, Run
@@ -61,6 +61,26 @@ class Rooms(unittest.TestCase):
 
 
 class Routes(unittest.TestCase):
+    def test_every_path_has_fights_and_no_long_calm_stretch(self):
+        from prism.dungeon import COMBAT, MIN_FIGHTS, route_paths
+        for seed in range(150):
+            route = generate_route(random.Random(seed), 1 + seed % 3)
+            self.assertTrue(all(n.kind == "fight" for n in route.layers[0]))
+            paths = route_paths(route)
+            for kinds in paths:
+                self.assertGreaterEqual(sum(k in COMBAT for k in kinds), MIN_FIGHTS, (seed, kinds))
+                for a, b in zip(kinds, kinds[1:]):
+                    self.assertFalse(a not in COMBAT and b not in COMBAT, (seed, kinds))
+
+    def test_paths_differ_in_difficulty_so_there_is_an_easier_way(self):
+        from prism.dungeon import route_paths
+        spread = 0
+        for seed in range(60):
+            paths = route_paths(generate_route(random.Random(seed), 2))
+            d = [sum({"fight": 1, "elite": 2}.get(k, 0) for k in p) for p in paths]
+            spread += max(d) > min(d)
+        self.assertGreater(spread, 40)
+
     def test_route_invariants_over_many_seeds(self):
         for seed in range(120):
             route = generate_route(random.Random(seed), 1 + seed % 3)
@@ -130,10 +150,10 @@ class RunFlow(unittest.TestCase):
             for o in opts:
                 r.player.hp = 5
                 before = (r.player.max_hp, r.player.hp, dict(r.player.cap), list(r.relics),
-                          dict(r.player.mods))
+                          dict(r.player.mods), list(r.player.patterns))
                 r.apply_reward(o)
                 after = (r.player.max_hp, r.player.hp, dict(r.player.cap), list(r.relics),
-                         dict(r.player.mods))
+                         dict(r.player.mods), list(r.player.patterns))
                 self.assertNotEqual(before, after, o)
         with self.assertRaises(ValueError):
             Run(seed=1).apply_reward({"id": "nonsense"})
@@ -167,7 +187,7 @@ class RunFlow(unittest.TestCase):
         self.assertGreaterEqual(len(run.shop), 3)
         ok, msg = run.buy(0)
         self.assertFalse(ok)
-        self.assertIn("gold", msg)
+        self.assertIn("glint", msg)
         self.assertFalse(run.buy(99)[0])
         self.assertFalse(run.buy(-1)[0])
         run.gold = 1000
@@ -196,27 +216,105 @@ class RunFlow(unittest.TestCase):
 
     def test_every_event_choice_works_or_explains_itself(self):
         for ev in EVENTS:
-            for cid, _label in ev["choices"]:
-                for gold, hp in ((0, 14), (50, 14), (50, 2), (0, 1)):
-                    r = Run(seed=4)
-                    r.event = ev
-                    r.gold, r.player.hp = gold, hp
-                    try:
-                        msg = r.resolve_event(cid)
-                        self.assertTrue(msg)
-                        self.assertGreaterEqual(r.player.hp, 1)
-                    except ValueError as e:
-                        self.assertTrue(str(e))
+            for variant in ("gift", "deal"):
+                for cid, _label, _effects in ev[variant]:
+                    for gold, hp in ((0, 14), (50, 14), (50, 2), (0, 1)):
+                        r = Run(seed=4)
+                        r.event = r.make_event(ev, variant)
+                        r.gold, r.player.hp = gold, hp
+                        before = (r.gold, r.player.hp, dict(r.player.cap), list(r.relics))
+                        try:
+                            msg = r.resolve_event(cid)
+                            self.assertTrue(msg)
+                            self.assertGreaterEqual(r.player.hp, 1)
+                        except ValueError as e:
+                            self.assertTrue(str(e))
+                            after = (r.gold, r.player.hp, dict(r.player.cap), list(r.relics))
+                            self.assertEqual(before, after)        # a refusal changes nothing
 
-    def test_altar_gives_relic_for_hp_and_refuses_when_too_weak(self):
+    def test_the_polisher_deal_costs_colour_or_glint_never_hp(self):
+        polisher = [e for e in EVENTS if e["id"] == "polisher"][0]
         r = Run(seed=2)
-        r.event = [e for e in EVENTS if e["id"] == "altar"][0]
-        r.resolve_event("blood")
-        self.assertEqual(r.player.hp, 11)
-        self.assertEqual(len(r.relics), 1)
-        r.player.hp = 3
+        r.player.cap["G"] = 6
+        r.event = r.make_event(polisher, "deal")
+        r.resolve_event("polish")
+        self.assertEqual((r.player.cap["G"], r.player.hp, len(r.relics)), (5, 14, 1))
+        r.event = r.make_event(polisher, "deal")
+        r.gold = 10
         with self.assertRaises(ValueError):
-            r.resolve_event("blood")
+            r.resolve_event("polish2")              # a fancy polish costs 30 glint
+
+    def test_a_colour_trade_is_always_between_two_colours(self):
+        well = [e for e in EVENTS if e["id"] == "well"][0]
+        ev = Run(seed=1).make_event(well, "deal")        # all caps equal at the start
+        drink = [c for c in ev["choices"] if c[0] == "drink"][0][2]
+        self.assertNotEqual(drink[0][1], drink[1][1])
+
+    def test_nothing_in_an_oddity_hurts(self):
+        # the tone is a toy box: costs are glint or a little colour, never HP
+        for ev in EVENTS:
+            for variant in ("gift", "deal"):
+                for cid, _label, effects in ev[variant]:
+                    flat = []
+                    for eff in effects:
+                        flat += [eff] + (list(eff[2]) + list(eff[3]) if eff[0] == "gamble" else [])
+                    self.assertEqual([e for e in flat if e[0] == "hp"], [], (ev["id"], cid))
+
+    def test_gifts_have_no_way_out_and_deals_do(self):
+        for ev in EVENTS:
+            gift_ids = [c[0] for c in ev["gift"]]
+            self.assertNotIn("leave", gift_ids, ev["id"])
+            for cid, _label, effects in ev["gift"]:
+                for eff in effects:       # a gift only gives
+                    self.assertFalse(eff[0] == "hp" or (eff[0] in ("glint", "maxhp") and eff[-1] < 0)
+                                     or (eff[0] == "cap" and eff[2] < 0), (ev["id"], cid))
+            self.assertIn("leave", [c[0] for c in ev["deal"]], ev["id"])
+            for cid, _label, effects in ev["deal"]:
+                if cid == "leave":
+                    continue
+                costs = [e for e in effects if e[0] == "gamble" or e[0] == "hp" or
+                         (e[0] in ("glint",) and e[1] < 0) or (e[0] == "cap" and e[2] < 0)]
+                self.assertTrue(costs, (ev["id"], cid))          # every deal has a drawback
+
+    def test_low_floors_give_more_gifts_high_floors_more_deals(self):
+        counts = {}
+        for act in (1, 3):
+            gifts = 0
+            for seed in range(200):
+                r = Run(seed=seed)
+                r.act = act
+                gifts += r.make_event()["variant"] == "gift"
+            counts[act] = gifts
+        self.assertGreater(counts[1], 120)
+        self.assertLess(counts[3], 60)
+
+    def test_every_effect_reads_as_words(self):
+        from prism.run import effect_text
+        r = Run(seed=1)
+        for ev in EVENTS:
+            for variant in ("gift", "deal"):
+                for _cid, _label, effects in r.make_event(ev, variant)["choices"]:
+                    for eff in effects:
+                        text = effect_text(eff)
+                        self.assertTrue(text and "None" not in text, eff)
+
+    def test_each_keeper_grows_a_side_with_its_perk(self):
+        from prism.consts import FORMS
+        r = Run(seed=9)
+        self.assertEqual(r.form()["shape"], "triangle")
+        hp, caps = r.player.max_hp, dict(r.player.cap)
+        r.layer, r.node = len(r.route.layers) - 1, 0
+        r.leave_node()
+        self.assertEqual(r.form()["shape"], "square")
+        self.assertEqual(r.player.max_hp, hp + FORMS[2]["max_hp"])
+        r.layer, r.node = len(r.route.layers) - 1, 0
+        r.leave_node()
+        self.assertEqual(r.form()["shape"], "pentagon")
+        self.assertEqual(r.player.cap, {c: v + FORMS[3]["cap"] for c, v in caps.items()})
+        r.layer, r.node = len(r.route.layers) - 1, 0
+        r.leave_node()
+        self.assertEqual(r.finished, "victory")
+        self.assertEqual(r.form()["shape"], 10)            # round enough (not round: that comes later)
 
     def test_act_progression_and_victory(self):
         r = Run(seed=9)
@@ -231,6 +329,127 @@ class RunFlow(unittest.TestCase):
         self.assertEqual(r.finished, "victory")
 
 
+class SpeedAndPatterns(unittest.TestCase):
+    """Fewer turns pay more; the patterns the Set used are yours to learn."""
+
+    def test_grades_against_par(self):
+        from prism.run import grade
+        self.assertEqual(grade(2, 3)["name"], "Clean")
+        self.assertEqual(grade(4, 3)["name"], "Clean")          # par + 1 is still clean
+        self.assertEqual(grade(5, 3)["name"], "Tidy")
+        self.assertEqual(grade(7, 3)["name"], "Messy")
+        self.assertIsNone(grade(3, None))
+
+    def test_a_clean_win_pays_more_and_offers_four_rewards(self):
+        got = {}
+        for turns in (3, 4, 9):
+            r = Run(seed=3)
+            r.route.layers[0][0].kind = "fight"
+            r.enter(0)
+            got[turns] = (r.finish_combat(True, turns=turns, par=2), len(r.reward_options()))
+        self.assertGreater(got[3][0], got[4][0])
+        self.assertGreater(got[4][0], got[9][0])
+        self.assertEqual(got[3][1], 4)
+        self.assertEqual(got[9][1], 3)
+
+    def test_built_fights_have_a_par(self):
+        st = build_combat(random.Random(4), 1, "fight", Player())
+        self.assertIsNotNone(st.par)
+        self.assertGreaterEqual(st.par, 1)
+
+    def test_a_hard_set_always_leaves_a_facet(self):
+        for seed in range(10):
+            r = Run(seed=seed)
+            r.route.layers[0][0].kind = "elite"
+            r.enter(0)
+            r.finish_combat(True)
+            self.assertTrue(any(o["id"].startswith("relic:") for o in r.reward_options()))
+
+    def test_beating_a_pattern_you_lack_offers_to_learn_it(self):
+        r = Run(seed=5)
+        r.route.layers[0][0].kind = "fight"
+        r.enter(0)
+        r.state.seen_patterns = {"leap"}
+        r.finish_combat(True)
+        opts = r.reward_options()
+        self.assertIn("pattern:leap", [o["id"] for o in opts])
+        r.apply_reward({"id": "pattern:leap"})
+        self.assertIn("leap", r.player.patterns)
+        r.apply_reward({"id": "pattern:leap"})
+        self.assertEqual(r.player.patterns.count("leap"), 1)
+        with self.assertRaises(ValueError):
+            r.apply_reward({"id": "pattern:nonsense"})
+
+    def test_fights_record_the_patterns_their_set_uses(self):
+        st = build_combat(random.Random(2), 2, "boss", Player(), verify=False)
+        self.assertIn(KINDS[BOSS_FOR_ACT[2]]["pattern"], st.seen_patterns)
+        self.assertIn(KINDS[KINDS[BOSS_FOR_ACT[2]]["summon"]]["pattern"], st.seen_patterns)
+
+    def test_fights_arrive_as_a_set_in_formation(self):
+        for act in (1, 2, 3):
+            for seed in range(10):
+                st = build_combat(random.Random(seed), act, "fight", Player(), verify=False)
+                squad = [e for e in st.enemies if e.squad is not None]
+                self.assertGreaterEqual(len(squad), 2, (act, seed))
+                self.assertEqual(len({(e.kind, e.shape) for e in squad}), 1)
+                xs = sorted(e.x for e in squad)
+                ys = sorted(e.y for e in squad)
+                self.assertLessEqual(max(xs[-1] - xs[0], ys[-1] - ys[0]), 6)
+
+    def test_the_set_starts_away_from_you(self):
+        for seed in range(20):
+            st = build_combat(random.Random(seed), 1 + seed % 3, "fight", Player(), verify=False)
+            for e in st.enemies:
+                self.assertGreater(max(abs(e.x - PLAYER_START[0]), abs(e.y - PLAYER_START[1])), 2)
+
+    def test_each_form_brings_its_own_pattern(self):
+        r = Run(seed=1)
+        self.assertEqual(r.player.patterns, ["beam", "slant"])
+        r.grow_to(2)
+        self.assertEqual((r.gift, r.player.patterns[-1]), ("halo", "halo"))
+        r.grow_to(3)
+        self.assertEqual((r.gift, r.player.patterns[-1]), ("lob", "lob"))
+        # already learned the form's pattern from the Set? you get the next one instead
+        r = Run(seed=1)
+        r.player.patterns.append("halo")
+        r.grow_to(2)
+        self.assertEqual(r.gift, "leap")
+
+    def test_shapes_are_introduced_one_at_a_time(self):
+        from prism.run import shapes_for
+        names = lambda act, layer: {s for s, _ in shapes_for(act, layer)}
+        self.assertEqual(names(1, 0), {"triangle"})
+        self.assertEqual(names(1, 1), {"triangle"})
+        self.assertEqual(names(1, 3), {"triangle", "square"})
+        self.assertEqual(names(2, 0), {"triangle", "square", "circle"})
+        r = Run(seed=4)
+        r.route.layers[0][0].kind = "fight"
+        r.enter(0)
+        self.assertEqual({e.shape for e in r.state.enemies}, {"triangle"})
+        keeper = KINDS[BOSS_FOR_ACT[1]]
+        self.assertNotIn("circle", keeper["shapes"])    # the first Keeper only uses what you've met
+
+    def test_shop_wares_have_names_and_descriptions(self):
+        r = Run(seed=2)
+        r.route.layers[0][0].kind = "shop"
+        r.enter(0)
+        for item in r.shop:
+            self.assertTrue(item["name"] and item["desc"] and item["label"])
+
+    def test_enemy_shapes_lean_rounder_as_you_climb(self):
+        counts = {}
+        for act in (1, 3):
+            n = {"triangle": 0, "circle": 0}
+            for seed in range(30):
+                st = build_combat(random.Random(seed), act, "fight", Player(), verify=False)
+                for e in st.enemies:
+                    if e.shape in n:
+                        n[e.shape] += 1
+            counts[act] = n
+        self.assertGreater(counts[1]["triangle"], counts[1]["circle"])
+        self.assertGreater(counts[3]["circle"], counts[3]["triangle"])
+
+
 class Persistence(unittest.TestCase):
     def test_meta_round_trip_and_corrupt_file(self):
         with tempfile.TemporaryDirectory() as d:
@@ -239,7 +458,8 @@ class Persistence(unittest.TestCase):
             m.record(2, False)
             m.record(3, True)
             m2 = Meta(path)
-            self.assertEqual(m2.data, {"runs": 2, "wins": 1, "best_act": 3})
+            self.assertEqual(m2.data, {"runs": 2, "wins": 1, "best_act": 3, "seen_intro": False,
+                                       "seen_board_key": False, "seen_danger_tip": False})
             with open(path, "w") as f:
                 f.write("{not json")
             self.assertEqual(Meta(path).data["runs"], 0)
@@ -267,18 +487,21 @@ class PathsToVictory(unittest.TestCase):
                  (3, "elite"), (1, "boss"), (2, "boss"), (3, "boss")]
         for act, kind in cases:
             for seed in range(3):
-                st = build_combat(random.Random(100 * act + seed), act, kind, Player())
+                kit = Run(seed=seed).grow_to(act).player        # as a real climb would arrive
+                st = build_combat(random.Random(100 * act + seed), act, kind, kit)
                 self.assertGreaterEqual(len(st.paths), REQUIRED_PATHS, (act, kind, seed))
                 self.assertEqual(len(set(st.paths)), len(st.paths))
+                self.assertIsNotNone(st.par, (act, kind, seed))
                 for name in st.paths:
-                    res = solve(st, CONSTRAINTS[name], max_turns=5, beat_beam=14, turn_beam=6)
+                    res = solve(st, CONSTRAINTS[name], **_solve_kw(st))
                     self.assertTrue(res.won, (act, kind, seed, name))
+                    self.assertGreaterEqual(res.turns, st.par)
                     self.assertEqual(self.replay(st, res.plan), "victory", (act, kind, seed, name))
-                    banned = CONSTRAINTS[name]
+                    allow = CONSTRAINTS[name]
                     for turn in res.plan:
                         for a in turn:
                             if a.kind == "cast":
-                                self.assertTrue(banned(a.shape, a.color), (name, a))
+                                self.assertTrue(allow(a.pattern, a.color), (name, a))
 
     def test_the_two_paths_use_different_tools(self):
         diffs = 0
@@ -347,3 +570,40 @@ class BotRun(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Roundness(unittest.TestCase):
+    """Sides are grown: the Round Door makes you round enough; every friend
+    you get out rounds you out more; everyone out, and you're round."""
+
+    def test_you_grow_rounder_with_every_rescue(self):
+        from prism.consts import TOWER_ORDER
+        from prism.world import ROUND_ENOUGH, your_sides
+        sides = [your_sides({"friends": list(TOWER_ORDER[:k])}) for k in range(len(TOWER_ORDER))]
+        self.assertEqual(sides[0], ROUND_ENOUGH)
+        self.assertEqual(sides, sorted(sides))
+        self.assertEqual(len(set(sides)), len(sides))           # every rescue adds sides
+        self.assertEqual(your_sides({"friends": list(TOWER_ORDER)}), 0)   # all out: round
+
+    def test_only_your_worlds_towers_count(self):
+        from prism.world import your_sides
+        data = {"plan": ["leaning", "lens"], "friends": ["leaning", "hollow"]}
+        self.assertGreater(your_sides(data), 10)
+        data["friends"].append("lens")
+        self.assertEqual(your_sides(data), 0)
+
+    def test_friends_keep_growing_after_theyre_out(self):
+        from prism.world import FRIEND_START, friend_sides
+        data = {"friends": ["leaning"], "sides": {"leaning": FRIEND_START}}
+        self.assertEqual(friend_sides("leaning", data), FRIEND_START)
+        data["friends"] += ["hollow", "toadstool"]
+        self.assertGreater(friend_sides("leaning", data), friend_sides("hollow", data))
+
+    def test_a_tower_climb_uses_your_sides(self):
+        from prism.run import Run
+        r = Run(3, tower="hollow")
+        r.sides = 18
+        self.assertEqual(r.form()["shape"], 18)
+        r.sides = 0
+        self.assertEqual(r.form()["shape"], "circle")
+
